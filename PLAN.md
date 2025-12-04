@@ -60,8 +60,14 @@ Videos:  raw → edited → encoding_submitted → encoded → ready_for_publish
 - Physically stored in Storj at: `products/{sku_label}/`
 - Database representation:
   - **`media_buckets` table**: First-class bucket entity with cached stats (raw count, edited count, etc.)
-  - **`product_media` junction table**: Links individual assets to bucket (membership)
+  - **`media_assets.media_bucket_id`**: Direct foreign key establishing bucket membership (one asset = one bucket)
+  - **`product_media_associations` table**: Optional metadata for variant heroes and gallery ordering
   - Query via `MediaBucket` class: `bucket.getPublishedAssets()`, `bucket.getRawSources()`, etc.
+
+**Key Design Choice:**
+- Each media asset belongs to exactly ONE bucket (enforced by `NOT NULL` FK on `media_assets.media_bucket_id`)
+- No many-to-many relationship for basic bucket membership (simpler, clearer ownership)
+- If the same image is needed for multiple products, copy the file (rare scenario, explicit duplication)
 
 ### Core Tables
 
@@ -196,6 +202,7 @@ Variant SKU: "UNIQUE-SKU-123"  ← OK if only one product has this pattern
 ```sql
 CREATE TABLE media_assets (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  media_bucket_id UUID NOT NULL REFERENCES media_buckets(id) ON DELETE CASCADE, -- Each asset belongs to exactly ONE bucket
   media_type VARCHAR(20) NOT NULL, -- image, video
   workflow_state VARCHAR(50) NOT NULL, -- raw, edited, encoding_submitted, encoded, ready_for_publish, published
 
@@ -236,37 +243,40 @@ CREATE TABLE media_assets (
   import_batch_id UUID -- group all files from same import job
 );
 
+CREATE INDEX idx_media_bucket ON media_assets(media_bucket_id);
 CREATE INDEX idx_media_workflow_state ON media_assets(workflow_state);
 CREATE INDEX idx_media_type ON media_assets(media_type);
 CREATE INDEX idx_media_workflow_category ON media_assets(workflow_category);
 CREATE INDEX idx_media_import_batch ON media_assets(import_batch_id);
+
+COMMENT ON COLUMN media_assets.media_bucket_id IS 'Foreign key to media_buckets. Each asset belongs to exactly one bucket (one product). NOT NULL enforces this constraint.';
 ```
 
-#### `product_media` (Junction Table)
+#### `product_media_associations` (Optional Metadata Table)
 ```sql
--- Links media assets to products (represents the "media bucket" relationship)
--- Each product (identified by sku_label) has a media bucket containing all associated assets
-CREATE TABLE product_media (
+-- Optional table for special associations like variant hero images and gallery ordering
+-- NOTE: Basic bucket membership is established via media_assets.media_bucket_id
+-- This table is ONLY for additional metadata like "which image is the hero for variant X"
+CREATE TABLE product_media_associations (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  product_id UUID REFERENCES products(id) ON DELETE CASCADE,
-  media_asset_id UUID REFERENCES media_assets(id) ON DELETE CASCADE,
-  association_type VARCHAR(50) NOT NULL, -- 'raw_source', 'product_gallery', 'variant_hero', 'project_file'
-  variant_id UUID REFERENCES product_variants(id) ON DELETE CASCADE, -- nullable, only for variant-specific hero images
+  media_asset_id UUID NOT NULL REFERENCES media_assets(id) ON DELETE CASCADE,
+  variant_id UUID REFERENCES product_variants(id) ON DELETE CASCADE, -- NULL for product-level associations
+  association_type VARCHAR(50) NOT NULL, -- 'variant_hero', 'product_gallery_order'
   position INTEGER DEFAULT 0, -- for ordering gallery images
   is_featured BOOLEAN DEFAULT FALSE, -- marks variant hero images
   created_at TIMESTAMP DEFAULT NOW(),
 
-  UNIQUE(product_id, media_asset_id, association_type, variant_id)
+  -- A variant can only have one hero image
+  UNIQUE(variant_id, association_type) WHERE association_type = 'variant_hero' AND variant_id IS NOT NULL
 );
 
-CREATE INDEX idx_product_media_product ON product_media(product_id);
-CREATE INDEX idx_product_media_asset ON product_media(media_asset_id);
-CREATE INDEX idx_product_media_variant ON product_media(variant_id);
-CREATE INDEX idx_product_media_association_type ON product_media(association_type);
+CREATE INDEX idx_pma_asset ON product_media_associations(media_asset_id);
+CREATE INDEX idx_pma_variant ON product_media_associations(variant_id);
+CREATE INDEX idx_pma_type ON product_media_associations(association_type);
 
-COMMENT ON TABLE product_media IS 'Junction table representing media bucket membership. All media assets linked to a product via this table constitute that product''s media bucket (identified by products.sku_label)';
-COMMENT ON COLUMN product_media.product_id IS 'Product owning the media bucket';
-COMMENT ON COLUMN product_media.association_type IS 'Type of media: raw_source (raw captures), product_gallery (edited photos), variant_hero (variant-specific hero), project_file (PSDs, etc)';
+COMMENT ON TABLE product_media_associations IS 'Optional metadata for special associations. Bucket membership is via media_assets.media_bucket_id. This table only tracks variant hero images and gallery ordering.';
+COMMENT ON COLUMN product_media_associations.variant_id IS 'For variant_hero type: which variant uses this asset as its hero image';
+COMMENT ON COLUMN product_media_associations.position IS 'For gallery ordering: display order in product gallery';
 ```
 
 #### `media_buckets`
@@ -312,64 +322,70 @@ COMMENT ON COLUMN media_buckets.sku_label IS 'Bucket identifier matching product
 COMMENT ON COLUMN media_buckets.storj_path IS 'Root path in Storj storage where all bucket assets are stored (e.g., products/RSV-V-PRODUCTXYZ/)';
 ```
 
-**Relationship to `product_media`:**
+**Relationship to `product_media_associations`:**
 - `media_buckets` is the **container** (one per product)
-- `product_media` is the **membership table** (links individual assets to bucket)
-- Query pattern: `bucket.getAssets()` → joins through `product_media` using `bucket.product_id`
+- `media_assets.media_bucket_id` establishes **bucket membership** (one asset = one bucket)
+- `product_media_associations` is **optional metadata** (variant heroes, gallery ordering)
+- Query pattern: `bucket.getAssets()` → `SELECT * FROM media_assets WHERE media_bucket_id = bucket.id`
 
-**Trigger to maintain cached counts:**
+**Triggers to maintain cached counts:**
 ```sql
 -- Update bucket counts when assets are added/removed
-CREATE OR REPLACE FUNCTION update_media_bucket_counts()
+CREATE OR REPLACE FUNCTION update_media_bucket_counts_on_asset_change()
 RETURNS TRIGGER AS $$
 BEGIN
   IF (TG_OP = 'INSERT') THEN
     UPDATE media_buckets
     SET
       total_asset_count = total_asset_count + 1,
-      raw_asset_count = raw_asset_count + CASE
-        WHEN (SELECT workflow_state FROM media_assets WHERE id = NEW.media_asset_id) = 'raw' THEN 1
-        ELSE 0
-      END,
-      edited_asset_count = edited_asset_count + CASE
-        WHEN (SELECT workflow_state FROM media_assets WHERE id = NEW.media_asset_id) IN ('edited', 'ready_for_publish') THEN 1
-        ELSE 0
-      END,
-      published_asset_count = published_asset_count + CASE
-        WHEN (SELECT workflow_state FROM media_assets WHERE id = NEW.media_asset_id) = 'published' THEN 1
-        ELSE 0
-      END,
+      raw_asset_count = raw_asset_count + CASE WHEN NEW.workflow_state = 'raw' THEN 1 ELSE 0 END,
+      edited_asset_count = edited_asset_count + CASE WHEN NEW.workflow_state IN ('edited', 'ready_for_publish') THEN 1 ELSE 0 END,
+      published_asset_count = published_asset_count + CASE WHEN NEW.workflow_state = 'published' THEN 1 ELSE 0 END,
+      project_file_count = project_file_count + CASE WHEN NEW.workflow_category = 'project_file' THEN 1 ELSE 0 END,
+      total_size_bytes = total_size_bytes + COALESCE(NEW.file_size, 0),
+      last_upload_at = NOW(),
       updated_at = NOW()
-    WHERE product_id = NEW.product_id;
+    WHERE id = NEW.media_bucket_id;
+    RETURN NEW;
+
+  ELSIF (TG_OP = 'UPDATE') THEN
+    -- Handle workflow state changes (e.g., raw → edited → published)
+    UPDATE media_buckets
+    SET
+      raw_asset_count = raw_asset_count
+        - CASE WHEN OLD.workflow_state = 'raw' THEN 1 ELSE 0 END
+        + CASE WHEN NEW.workflow_state = 'raw' THEN 1 ELSE 0 END,
+      edited_asset_count = edited_asset_count
+        - CASE WHEN OLD.workflow_state IN ('edited', 'ready_for_publish') THEN 1 ELSE 0 END
+        + CASE WHEN NEW.workflow_state IN ('edited', 'ready_for_publish') THEN 1 ELSE 0 END,
+      published_asset_count = published_asset_count
+        - CASE WHEN OLD.workflow_state = 'published' THEN 1 ELSE 0 END
+        + CASE WHEN NEW.workflow_state = 'published' THEN 1 ELSE 0 END,
+      total_size_bytes = total_size_bytes - COALESCE(OLD.file_size, 0) + COALESCE(NEW.file_size, 0),
+      updated_at = NOW()
+    WHERE id = NEW.media_bucket_id;
+    RETURN NEW;
 
   ELSIF (TG_OP = 'DELETE') THEN
     UPDATE media_buckets
     SET
       total_asset_count = GREATEST(total_asset_count - 1, 0),
-      raw_asset_count = GREATEST(raw_asset_count - CASE
-        WHEN (SELECT workflow_state FROM media_assets WHERE id = OLD.media_asset_id) = 'raw' THEN 1
-        ELSE 0
-      END, 0),
-      edited_asset_count = GREATEST(edited_asset_count - CASE
-        WHEN (SELECT workflow_state FROM media_assets WHERE id = OLD.media_asset_id) IN ('edited', 'ready_for_publish') THEN 1
-        ELSE 0
-      END, 0),
-      published_asset_count = GREATEST(published_asset_count - CASE
-        WHEN (SELECT workflow_state FROM media_assets WHERE id = OLD.media_asset_id) = 'published' THEN 1
-        ELSE 0
-      END, 0),
+      raw_asset_count = GREATEST(raw_asset_count - CASE WHEN OLD.workflow_state = 'raw' THEN 1 ELSE 0 END, 0),
+      edited_asset_count = GREATEST(edited_asset_count - CASE WHEN OLD.workflow_state IN ('edited', 'ready_for_publish') THEN 1 ELSE 0 END, 0),
+      published_asset_count = GREATEST(published_asset_count - CASE WHEN OLD.workflow_state = 'published' THEN 1 ELSE 0 END, 0),
+      project_file_count = GREATEST(project_file_count - CASE WHEN OLD.workflow_category = 'project_file' THEN 1 ELSE 0 END, 0),
+      total_size_bytes = GREATEST(total_size_bytes - COALESCE(OLD.file_size, 0), 0),
       updated_at = NOW()
-    WHERE product_id = OLD.product_id;
+    WHERE id = OLD.media_bucket_id;
+    RETURN OLD;
   END IF;
-
-  RETURN NULL;
 END;
 $$ LANGUAGE plpgsql;
 
-CREATE TRIGGER trg_update_bucket_counts
-  AFTER INSERT OR DELETE ON product_media
+CREATE TRIGGER trg_update_bucket_counts_on_asset
+  AFTER INSERT OR UPDATE OR DELETE ON media_assets
   FOR EACH ROW
-  EXECUTE FUNCTION update_media_bucket_counts();
+  EXECUTE FUNCTION update_media_bucket_counts_on_asset_change();
 ```
 
 #### `users`
