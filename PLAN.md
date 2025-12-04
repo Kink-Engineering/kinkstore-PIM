@@ -42,6 +42,27 @@ Videos:  raw → edited → encoding_submitted → encoded → ready_for_publish
 
 ## Database Schema
 
+### Core Concepts
+
+**SKU vs SKU Label:**
+- **SKU**: Exists at variant level only (Shopify reality). Example: `RSV-PRODUCTXYZ-S`, `RSV-PRODUCTXYZ-M`
+- **SKU Label**: Exists at product level (PIM internal). Example: `RSV-PRODUCTXYZ`
+  - For multi-variant products: base name without size/color suffix
+  - For single-variant products: same as the variant's SKU
+  - Always unique across all products
+  - Never collides with any variant SKU
+
+**Media Bucket Concept:**
+- A **media bucket** is a first-class entity representing ALL media associated with a SKU Label
+- One bucket per product (one-to-one with SKU Label)
+- Bucket identifier = SKU Label (e.g., `RSV-PRODUCTXYZ`)
+- Contains: raw captures, edited photos, videos, project files (PSDs), all workflow stages
+- Physically stored in Storj at: `products/{sku_label}/`
+- Database representation:
+  - **`media_buckets` table**: First-class bucket entity with cached stats (raw count, edited count, etc.)
+  - **`product_media` junction table**: Links individual assets to bucket (membership)
+  - Query via `MediaBucket` class: `bucket.getPublishedAssets()`, `bucket.getRawSources()`, etc.
+
 ### Core Tables
 
 #### `products`
@@ -53,6 +74,12 @@ CREATE TABLE products (
   description TEXT,
   description_html TEXT,
   handle VARCHAR(255),
+  sku_label VARCHAR(255), -- descriptive SKU for human reference (e.g., "RSV-V-PRODUCTXYZ")
+                          -- NOTE: This is NOT a Shopify SKU (those live on variants)
+                          -- This is an internal label derived from variant SKUs by removing size suffix
+                          -- Example: variants have "RSV-V-PRODUCTXYZ-S", "RSV-V-PRODUCTXYZ-M", "RSV-V-PRODUCTXYZ-L"
+                          --          product sku_label is "RSV-V-PRODUCTXYZ" (does not exist in Shopify)
+                          -- MUST be unique across all products AND must not collide with any variant SKU
   vendor VARCHAR(255),
   product_type VARCHAR(255),
   tags TEXT[], -- PostgreSQL array
@@ -63,11 +90,12 @@ CREATE TABLE products (
   created_at TIMESTAMP DEFAULT NOW(),
   updated_at TIMESTAMP DEFAULT NOW(),
   last_synced_at TIMESTAMP,
-  google_drive_folder_path VARCHAR(500) -- for import reference
+  google_drive_folder_path VARCHAR(500) -- for import reference (e.g., "RSV-V-PRODUCTXYZ")
 );
 
 CREATE INDEX idx_products_shopify_id ON products(shopify_product_id);
 CREATE INDEX idx_products_status ON products(status);
+CREATE UNIQUE INDEX idx_products_sku_label_unique ON products(sku_label) WHERE sku_label IS NOT NULL;
 ```
 
 #### `product_variants`
@@ -94,7 +122,74 @@ CREATE TABLE product_variants (
 
 CREATE INDEX idx_variants_product_id ON product_variants(product_id);
 CREATE INDEX idx_variants_shopify_id ON product_variants(shopify_variant_id);
-CREATE INDEX idx_variants_sku ON product_variants(sku);
+CREATE UNIQUE INDEX idx_variants_sku_unique ON product_variants(sku) WHERE sku IS NOT NULL;
+```
+
+#### SKU Uniqueness Constraints
+
+**Cross-table uniqueness requirement:**
+- `products.sku_label` must be unique across all products
+- `product_variants.sku` must be unique across all variants
+- **`products.sku_label` must NOT collide with ANY `product_variants.sku`**
+
+**Database enforcement:**
+```sql
+-- Constraint function to prevent product sku_label from matching any variant sku
+CREATE OR REPLACE FUNCTION check_product_sku_label_uniqueness()
+RETURNS TRIGGER AS $$
+BEGIN
+  -- Check if this sku_label exists as a variant SKU anywhere
+  IF EXISTS (
+    SELECT 1 FROM product_variants
+    WHERE sku = NEW.sku_label
+  ) THEN
+    RAISE EXCEPTION 'Product sku_label "%" conflicts with existing variant SKU', NEW.sku_label;
+  END IF;
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_check_product_sku_label
+  BEFORE INSERT OR UPDATE ON products
+  FOR EACH ROW
+  WHEN (NEW.sku_label IS NOT NULL)
+  EXECUTE FUNCTION check_product_sku_label_uniqueness();
+
+-- Constraint function to prevent variant sku from matching any product sku_label
+CREATE OR REPLACE FUNCTION check_variant_sku_uniqueness()
+RETURNS TRIGGER AS $$
+BEGIN
+  -- Check if this variant SKU exists as a product sku_label anywhere
+  IF EXISTS (
+    SELECT 1 FROM products
+    WHERE sku_label = NEW.sku
+  ) THEN
+    RAISE EXCEPTION 'Variant SKU "%" conflicts with existing product sku_label', NEW.sku;
+  END IF;
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_check_variant_sku
+  BEFORE INSERT OR UPDATE ON product_variants
+  FOR EACH ROW
+  WHEN (NEW.sku IS NOT NULL)
+  EXECUTE FUNCTION check_variant_sku_uniqueness();
+```
+
+**Why this matters:**
+```
+❌ BAD: Collision scenario
+Product sku_label: "PRODUCT-ABC"
+Variant SKU: "PRODUCT-ABC"  ← collision! Which one is it?
+
+✅ GOOD: Proper naming
+Product sku_label: "PRODUCT-ABC"
+Variant SKUs: "PRODUCT-ABC-S", "PRODUCT-ABC-M", "PRODUCT-ABC-L"
+
+✅ ALSO GOOD: Single-variant product
+Product sku_label: "UNIQUE-SKU-123"
+Variant SKU: "UNIQUE-SKU-123"  ← OK if only one product has this pattern
 ```
 
 #### `media_assets`
@@ -104,18 +199,13 @@ CREATE TABLE media_assets (
   media_type VARCHAR(20) NOT NULL, -- image, video
   workflow_state VARCHAR(50) NOT NULL, -- raw, edited, encoding_submitted, encoded, ready_for_publish, published
 
-  -- File storage
-  raw_file_url VARCHAR(500), -- Storj URL for raw file
-  raw_file_key VARCHAR(500), -- Storj object key
-  raw_file_size BIGINT,
-  raw_file_mime_type VARCHAR(100),
+  -- File storage (use appropriate field based on workflow_state)
+  file_url VARCHAR(500) NOT NULL, -- Storj URL
+  file_key VARCHAR(500) NOT NULL, -- Storj object key (e.g., products/RSV-B-FILLER-PLUG/photos/raw/DSC09935.JPG)
+  file_size BIGINT,
+  file_mime_type VARCHAR(100),
 
-  edited_file_url VARCHAR(500), -- Storj URL for edited file
-  edited_file_key VARCHAR(500),
-  edited_file_size BIGINT,
-  edited_file_mime_type VARCHAR(100),
-
-  -- Video-specific
+  -- Video-specific (for encoding workflow)
   encoding_job_id VARCHAR(255), -- external encoding API job ID
   encoded_video_url VARCHAR(500), -- final encoded video URL from API
   video_metadata JSONB, -- duration, resolution, codec, etc.
@@ -126,7 +216,13 @@ CREATE TABLE media_assets (
   -- Common metadata
   alt_text TEXT,
   title VARCHAR(255),
-  original_filename VARCHAR(255),
+  original_filename VARCHAR(255) NOT NULL,
+  source_folder_path VARCHAR(500), -- original folder path from import (e.g., "Photos/New Raw Captures")
+
+  -- Workflow categorization
+  workflow_category VARCHAR(100) NOT NULL, -- raw_capture, final_ecom, project_file, psd_cutout
+  edited_by UUID REFERENCES users(id),
+  edited_at TIMESTAMP,
 
   -- Tracking
   uploaded_by UUID REFERENCES users(id),
@@ -135,23 +231,29 @@ CREATE TABLE media_assets (
 
   -- Import tracking
   google_drive_file_id VARCHAR(255),
-  import_source VARCHAR(255)
+  google_drive_folder_path VARCHAR(500), -- full path from Google Drive (e.g., "RSV-B-FILLER-PLUG/Photos/New Raw Captures")
+  import_source VARCHAR(255),
+  import_batch_id UUID -- group all files from same import job
 );
 
 CREATE INDEX idx_media_workflow_state ON media_assets(workflow_state);
 CREATE INDEX idx_media_type ON media_assets(media_type);
+CREATE INDEX idx_media_workflow_category ON media_assets(workflow_category);
+CREATE INDEX idx_media_import_batch ON media_assets(import_batch_id);
 ```
 
 #### `product_media` (Junction Table)
 ```sql
+-- Links media assets to products (represents the "media bucket" relationship)
+-- Each product (identified by sku_label) has a media bucket containing all associated assets
 CREATE TABLE product_media (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   product_id UUID REFERENCES products(id) ON DELETE CASCADE,
   media_asset_id UUID REFERENCES media_assets(id) ON DELETE CASCADE,
-  association_type VARCHAR(50) NOT NULL, -- product_hero, product_gallery, variant_specific, collection_hero
-  variant_id UUID REFERENCES product_variants(id) ON DELETE CASCADE, -- nullable, only for variant-specific
+  association_type VARCHAR(50) NOT NULL, -- 'raw_source', 'product_gallery', 'variant_hero', 'project_file'
+  variant_id UUID REFERENCES product_variants(id) ON DELETE CASCADE, -- nullable, only for variant-specific hero images
   position INTEGER DEFAULT 0, -- for ordering gallery images
-  is_featured BOOLEAN DEFAULT FALSE,
+  is_featured BOOLEAN DEFAULT FALSE, -- marks variant hero images
   created_at TIMESTAMP DEFAULT NOW(),
 
   UNIQUE(product_id, media_asset_id, association_type, variant_id)
@@ -160,6 +262,114 @@ CREATE TABLE product_media (
 CREATE INDEX idx_product_media_product ON product_media(product_id);
 CREATE INDEX idx_product_media_asset ON product_media(media_asset_id);
 CREATE INDEX idx_product_media_variant ON product_media(variant_id);
+CREATE INDEX idx_product_media_association_type ON product_media(association_type);
+
+COMMENT ON TABLE product_media IS 'Junction table representing media bucket membership. All media assets linked to a product via this table constitute that product''s media bucket (identified by products.sku_label)';
+COMMENT ON COLUMN product_media.product_id IS 'Product owning the media bucket';
+COMMENT ON COLUMN product_media.association_type IS 'Type of media: raw_source (raw captures), product_gallery (edited photos), variant_hero (variant-specific hero), project_file (PSDs, etc)';
+```
+
+#### `media_buckets`
+```sql
+-- Explicit media bucket entity - one per product
+-- Provides a first-class domain object for media organization and querying
+CREATE TABLE media_buckets (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  product_id UUID UNIQUE NOT NULL REFERENCES products(id) ON DELETE CASCADE,
+  sku_label VARCHAR(255) UNIQUE NOT NULL, -- denormalized from products.sku_label for direct access
+
+  -- Bucket metadata
+  bucket_status VARCHAR(50) DEFAULT 'active', -- active, archived, needs_review
+  storj_path VARCHAR(500) NOT NULL, -- e.g., "products/RSV-V-PRODUCTXYZ/"
+
+  -- Cached counts (updated via triggers for performance)
+  raw_asset_count INTEGER DEFAULT 0,
+  edited_asset_count INTEGER DEFAULT 0,
+  published_asset_count INTEGER DEFAULT 0,
+  project_file_count INTEGER DEFAULT 0,
+  total_asset_count INTEGER DEFAULT 0,
+  total_size_bytes BIGINT DEFAULT 0,
+
+  -- Timestamps
+  created_at TIMESTAMP DEFAULT NOW(),
+  updated_at TIMESTAMP DEFAULT NOW(),
+  last_upload_at TIMESTAMP,
+  last_publish_at TIMESTAMP,
+
+  -- Import tracking
+  google_drive_folder_path VARCHAR(500), -- original folder path
+  import_batch_id UUID,
+  import_completed_at TIMESTAMP
+);
+
+CREATE INDEX idx_media_buckets_product ON media_buckets(product_id);
+CREATE INDEX idx_media_buckets_sku_label ON media_buckets(sku_label);
+CREATE INDEX idx_media_buckets_status ON media_buckets(bucket_status);
+CREATE INDEX idx_media_buckets_import_batch ON media_buckets(import_batch_id);
+
+COMMENT ON TABLE media_buckets IS 'First-class media bucket entity. One bucket per product, identified by sku_label. Contains all media assets (raw, edited, published, project files) for that product.';
+COMMENT ON COLUMN media_buckets.sku_label IS 'Bucket identifier matching products.sku_label. For multi-variant: base SKU (e.g., RSV-V-PRODUCTXYZ). For single-variant: same as variant SKU.';
+COMMENT ON COLUMN media_buckets.storj_path IS 'Root path in Storj storage where all bucket assets are stored (e.g., products/RSV-V-PRODUCTXYZ/)';
+```
+
+**Relationship to `product_media`:**
+- `media_buckets` is the **container** (one per product)
+- `product_media` is the **membership table** (links individual assets to bucket)
+- Query pattern: `bucket.getAssets()` → joins through `product_media` using `bucket.product_id`
+
+**Trigger to maintain cached counts:**
+```sql
+-- Update bucket counts when assets are added/removed
+CREATE OR REPLACE FUNCTION update_media_bucket_counts()
+RETURNS TRIGGER AS $$
+BEGIN
+  IF (TG_OP = 'INSERT') THEN
+    UPDATE media_buckets
+    SET
+      total_asset_count = total_asset_count + 1,
+      raw_asset_count = raw_asset_count + CASE
+        WHEN (SELECT workflow_state FROM media_assets WHERE id = NEW.media_asset_id) = 'raw' THEN 1
+        ELSE 0
+      END,
+      edited_asset_count = edited_asset_count + CASE
+        WHEN (SELECT workflow_state FROM media_assets WHERE id = NEW.media_asset_id) IN ('edited', 'ready_for_publish') THEN 1
+        ELSE 0
+      END,
+      published_asset_count = published_asset_count + CASE
+        WHEN (SELECT workflow_state FROM media_assets WHERE id = NEW.media_asset_id) = 'published' THEN 1
+        ELSE 0
+      END,
+      updated_at = NOW()
+    WHERE product_id = NEW.product_id;
+
+  ELSIF (TG_OP = 'DELETE') THEN
+    UPDATE media_buckets
+    SET
+      total_asset_count = GREATEST(total_asset_count - 1, 0),
+      raw_asset_count = GREATEST(raw_asset_count - CASE
+        WHEN (SELECT workflow_state FROM media_assets WHERE id = OLD.media_asset_id) = 'raw' THEN 1
+        ELSE 0
+      END, 0),
+      edited_asset_count = GREATEST(edited_asset_count - CASE
+        WHEN (SELECT workflow_state FROM media_assets WHERE id = OLD.media_asset_id) IN ('edited', 'ready_for_publish') THEN 1
+        ELSE 0
+      END, 0),
+      published_asset_count = GREATEST(published_asset_count - CASE
+        WHEN (SELECT workflow_state FROM media_assets WHERE id = OLD.media_asset_id) = 'published' THEN 1
+        ELSE 0
+      END, 0),
+      updated_at = NOW()
+    WHERE product_id = OLD.product_id;
+  END IF;
+
+  RETURN NULL;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_update_bucket_counts
+  AFTER INSERT OR DELETE ON product_media
+  FOR EACH ROW
+  EXECUTE FUNCTION update_media_bucket_counts();
 ```
 
 #### `users`
@@ -684,22 +894,484 @@ CREATE INDEX idx_audit_logs_created ON audit_logs(created_at);
 - Update `media_assets.encoded_video_url` when complete
 - Update `media_assets.workflow_state` to 'encoded'
 
+## Media Versioning & Historical Asset Management
+
+### Problem Statement
+The current folder-based system (e.g., `RSV-B-FILLER-PLUG/`) organizes media by workflow stage in nested folders:
+```
+RSV-B-FILLER-PLUG/
+├── Photos/
+│   ├── Raw Captures/              # Original photographer uploads
+│   ├── New Raw Captures/          # New photography session
+│   ├── Final ECOM Product Photos/ # Edited, ready for ecommerce
+│   │   └── new version/           # Re-edited versions
+│   └── PSD Cutouts/               # Project files (Photoshop)
+├── Videos/
+│   ├── Project Files/             # Raw video project files
+│   └── Final ECOM Videos/         # Edited, ready for ecommerce
+└── Description.docx               # Product copy
+```
+
+**Requirements**:
+1. Keep all source/raw images together as a set
+2. Keep all edited images together as a set
+3. Know the relationship between the two sets (folder-level, not file-level)
+4. Use SKU as descriptive label (not as database key)
+
+### Solution: Simple Set-Based Organization
+
+#### Core Concept
+
+**Asset Collections** - Group files by product and workflow stage:
+- Each product (identified by Shopify Product ID) has associated media
+- Media is organized into logical sets: "raw photos", "edited photos", "project files", etc.
+- No need to track individual file lineage (raw file X → edited file Y)
+- Folder structure preserved in cloud storage for easy browsing
+
+#### Simplified Approach
+
+**What we track:**
+- ✅ Which product does this media belong to?
+- ✅ What stage is this media in? (raw, edited, project file)
+- ✅ Where did it come from originally? (folder path for reference)
+- ✅ What's a human-readable label? (SKU like "RSV-B-FILLER-PLUG")
+
+**What we DON'T track:**
+- ❌ Individual file-to-file relationships (this raw → that edited)
+- ❌ Version numbers for each file
+- ❌ Parent-child lineage chains
+- ❌ Active/inactive version flags per file
+
+#### Migration Strategy - Simple Import
+
+When importing from Google Drive folders like `RSV-B-FILLER-PLUG/`:
+
+**Step 1: Map folder to product**
+```
+Folder: RSV-B-FILLER-PLUG
+→ Maps to Shopify Product ID: 7891234567890
+→ Descriptive label: "RSV-B-FILLER-PLUG" (stored for human reference)
+```
+
+**Step 2: Import all files, preserving folder structure**
+```sql
+-- Raw photo example
+INSERT INTO media_assets (
+  media_type: 'image',
+  workflow_state: 'raw',
+  raw_file_url: 'https://storj.../products/RSV-B-FILLER-PLUG/photos/raw/DSC09935.JPG',
+  raw_file_key: 'products/RSV-B-FILLER-PLUG/photos/raw/DSC09935.JPG',
+  workflow_category: 'raw_capture',
+  source_folder_path: 'Photos/New Raw Captures',
+  original_filename: 'DSC09935.JPG',
+  google_drive_folder_path: 'RSV-B-FILLER-PLUG/Photos/New Raw Captures'
+);
+
+-- Link to product
+INSERT INTO product_media (
+  product_id: <product-uuid>,
+  media_asset_id: <media-uuid>,
+  association_type: 'raw_source'
+);
+
+-- Edited photo example
+INSERT INTO media_assets (
+  media_type: 'image',
+  workflow_state: 'ready_for_publish',
+  edited_file_url: 'https://storj.../products/RSV-B-FILLER-PLUG/photos/edited/filler-plug-3.jpg',
+  edited_file_key: 'products/RSV-B-FILLER-PLUG/photos/edited/filler-plug-3.jpg',
+  workflow_category: 'final_ecom',
+  source_folder_path: 'Photos/Final ECOM Product Photos/new version',
+  original_filename: 'filler plug 3.jpg',
+  google_drive_folder_path: 'RSV-B-FILLER-PLUG/Photos/Final ECOM Product Photos/new version'
+);
+
+-- Link to product
+INSERT INTO product_media (
+  product_id: <product-uuid>,
+  media_asset_id: <media-uuid>,
+  association_type: 'product_gallery'
+);
+```
+
+**That's it!** No complex linking, no version tracking, no parent-child relationships.
+
+#### UI/UX for Asset Management
+
+**Product Detail Page - Media Tab**
+```
+Product: RSV-B-FILLER-PLUG (SKU label)
+Shopify Product ID: 7891234567890
+
+[Edited Photos - Ready for Shopify] (7 images)
+  - filler plug 3.jpg
+  - filler plug 4.jpg
+  - filler plug 5.jpg
+  ...
+  [Reorder Gallery] [Upload New] [Edit Selected]
+
+[Raw Source Photos] (10 images) - collapsed by default
+  Click to expand and browse all raw captures
+  [Download All as ZIP] [Browse]
+
+[Project Files] (1 file) - collapsed by default
+  - filler plug 4 FA.psd
+  [Download]
+```
+
+**Media Library - Product Filter View**
+```
+Filter by Product: RSV-B-FILLER-PLUG
+
+Raw Sources (10 files)
+  From: Photos/New Raw Captures
+  [Browse Thumbnails]
+
+Edited Photos (7 files)
+  From: Photos/Final ECOM Product Photos/new version
+  [Browse Thumbnails] [Select for Publishing]
+
+Project Files (1 file)
+  From: Photos/PSD Cutouts
+  [Download]
+
+Note: "Raw sources came from New Raw Captures folder"
+      (folder-level relationship preserved)
+```
+
+**Media Library - Simple Filters**
+```
+[ By Product | By Type | By Workflow Stage ]
+
+Workflow Stages:
+- Raw Sources (all raw captures)
+- Edited/Final (ready for publishing)
+- Project Files (PSDs, project files)
+
+Group by:
+- Product (shows sets: "RSV-B-FILLER-PLUG: 10 raw, 7 edited")
+- Date uploaded
+- Folder source
+```
+
+#### Storj File Organization
+
+Preserve logical folder structure on Storj:
+```
+storj://kinkstore-pim/
+├── products/
+│   └── RSV-B-FILLER-PLUG/
+│       ├── photos/
+│       │   ├── raw/
+│       │   │   ├── DSC09935.JPG
+│       │   │   ├── DSC09937.JPG
+│       │   │   └── ...
+│       │   ├── edited/
+│       │   │   ├── DSC09935-v2.jpg
+│       │   │   ├── DSC09935-v3.jpg
+│       │   │   └── ...
+│       │   └── project/
+│       │       ├── filler-plug-4.psd
+│       │       └── ...
+│       └── videos/
+│           ├── raw/
+│           ├── edited/
+│           ├── encoded/
+│           └── project/
+```
+
+#### MediaBucket Class Interface
+
+The `MediaBucket` domain class provides a high-level API for working with product media:
+
+**TypeScript/JavaScript Example:**
+```typescript
+class MediaBucket {
+  id: string;
+  productId: string;
+  skuLabel: string;
+  storjPath: string;
+
+  // Cached counts (from media_buckets table)
+  rawAssetCount: number;
+  editedAssetCount: number;
+  publishedAssetCount: number;
+  projectFileCount: number;
+  totalAssetCount: number;
+
+  // Query methods
+  async getPublishedAssets(): Promise<MediaAsset[]>;
+  async getEditedAssets(): Promise<MediaAsset[]>;
+  async getRawSources(): Promise<MediaAsset[]>;
+  async getProjectFiles(): Promise<MediaAsset[]>;
+  async getAllAssets(): Promise<MediaAsset[]>;
+
+  // Filtering
+  async getAssetsByWorkflowState(state: WorkflowState): Promise<MediaAsset[]>;
+  async getAssetsByType(type: 'image' | 'video'): Promise<MediaAsset[]>;
+
+  // Variant operations
+  async getVariantHeroImage(variantId: string): Promise<MediaAsset | null>;
+  async setVariantHeroImage(variantId: string, assetId: string): Promise<void>;
+
+  // Bulk operations
+  async addAssets(assets: MediaAsset[], associationType: string): Promise<void>;
+  async removeAsset(assetId: string): Promise<void>;
+
+  // Statistics
+  async getTotalSize(): Promise<number>;
+  async getAssetCountsByState(): Promise<Record<WorkflowState, number>>;
+}
+```
+
+**Usage Examples:**
+```typescript
+// Get bucket by SKU label
+const bucket = await MediaBucket.findBySkuLabel('RSV-V-PRODUCTXYZ');
+
+// Query published assets
+const publishedAssets = await bucket.getPublishedAssets();
+// → Returns all assets with workflow_state = 'published'
+
+// Query edited (ready for publish) assets
+const editedAssets = await bucket.getEditedAssets();
+// → Returns all assets with workflow_state IN ('edited', 'ready_for_publish')
+
+// Query raw sources
+const rawAssets = await bucket.getRawSources();
+// → Returns all assets with workflow_state = 'raw'
+
+// Get quick stats without querying assets
+console.log(`Bucket has ${bucket.rawAssetCount} raw, ${bucket.editedAssetCount} edited`);
+
+// Set variant hero image
+await bucket.setVariantHeroImage(variantId, heroImageAssetId);
+```
+
+#### Key SQL Queries
+
+**Get all media for a product (by type):**
+```sql
+-- Via MediaBucket class: bucket.getEditedAssets()
+SELECT ma.*
+FROM media_assets ma
+JOIN product_media pm ON pm.media_asset_id = ma.id
+JOIN media_buckets mb ON mb.product_id = pm.product_id
+WHERE mb.sku_label = 'RSV-V-PRODUCTXYZ'
+  AND ma.workflow_state IN ('edited', 'ready_for_publish')
+ORDER BY ma.original_filename;
+
+-- Via MediaBucket class: bucket.getRawSources()
+SELECT ma.*
+FROM media_assets ma
+JOIN product_media pm ON pm.media_asset_id = ma.id
+JOIN media_buckets mb ON mb.product_id = pm.product_id
+WHERE mb.sku_label = 'RSV-V-PRODUCTXYZ'
+  AND ma.workflow_state = 'raw'
+ORDER BY ma.created_at;
+
+-- Via MediaBucket class: bucket.getPublishedAssets()
+SELECT ma.*
+FROM media_assets ma
+JOIN product_media pm ON pm.media_asset_id = ma.id
+JOIN media_buckets mb ON mb.product_id = pm.product_id
+WHERE mb.sku_label = 'RSV-V-PRODUCTXYZ'
+  AND ma.workflow_state = 'published'
+ORDER BY pm.position;
+
+-- Via MediaBucket class: bucket.getProjectFiles()
+SELECT ma.*
+FROM media_assets ma
+JOIN product_media pm ON pm.media_asset_id = ma.id
+WHERE pm.product_id = (SELECT product_id FROM media_buckets WHERE sku_label = 'RSV-V-PRODUCTXYZ')
+  AND ma.workflow_category = 'project_file';
+```
+
+**Get bucket by SKU label (with cached stats):**
+```sql
+-- Fast lookup with pre-computed counts
+SELECT * FROM media_buckets WHERE sku_label = 'RSV-V-PRODUCTXYZ';
+-- Returns: id, product_id, sku_label, raw_asset_count, edited_asset_count, etc.
+```
+
+**Get all media sets for a product (summary):**
+```sql
+SELECT
+  p.title,
+  p.handle as sku_label,
+  COUNT(CASE WHEN ma.workflow_category = 'raw_capture' THEN 1 END) as raw_count,
+  COUNT(CASE WHEN ma.workflow_category = 'final_ecom' THEN 1 END) as edited_count,
+  COUNT(CASE WHEN ma.workflow_category = 'project_file' THEN 1 END) as project_count
+FROM products p
+LEFT JOIN product_media pm ON pm.product_id = p.id
+LEFT JOIN media_assets ma ON ma.id = pm.media_asset_id
+WHERE p.id = 'xxx'
+GROUP BY p.id, p.title, p.handle;
+```
+
+**Find folder-level relationships:**
+```sql
+-- What folder did these edited photos come from?
+SELECT DISTINCT source_folder_path, workflow_category
+FROM media_assets ma
+JOIN product_media pm ON pm.media_asset_id = ma.id
+WHERE pm.product_id = 'yyy'
+ORDER BY workflow_category;
+
+-- Result shows: "Raw came from 'Photos/New Raw Captures', Edited came from 'Photos/Final ECOM Product Photos/new version'"
+```
+
+#### Benefits
+
+1. **Simple & Fast**: No complex version tracking or manual linking required
+2. **Set-Based Organization**: Raw sources stay together, edited photos stay together
+3. **Folder Context Preserved**: Know that "edited photos came from New Raw Captures folder"
+4. **SKU as Label**: Human-readable "RSV-B-FILLER-PLUG" label for easy reference (not used as key)
+5. **Clean Migration**: Straightforward import - just copy files and associate with product
+6. **Easy Browsing**: "Show me all raw sources for this product" or "Show me finished photos"
+7. **Project Files Included**: PSDs and project files stored alongside, grouped by product
+8. **No Unnecessary Complexity**: Tracks only what's actually needed for the workflow
+9. **Flexible Queries**: Easy to find "all edited photos" or "all raw sources" for a product
+10. **Storage Efficient**: Folder structure on Storj mirrors original organization
+
+## Product-Variant Media Strategy
+
+### Confirmed Requirements
+
+Based on actual workflow:
+
+1. **Products have multiple variants** (sizes, colors, etc.)
+2. **All variants share same media pool** - One media bucket per product
+3. **Variant hero images** - Each variant can have ONE designated hero image from the shared pool
+4. **Folder consolidation** - Even if historically split (e.g., `PRODUCT-BLACK/`, `PRODUCT-RED/`), consolidate to single `PRODUCT/` folder at import
+
+### SKU Naming Convention
+
+**Important**: The internal naming convention uses a **product-level SKU label** that does NOT exist in Shopify:
+
+**Example:**
+```
+Shopify Variants (actual SKUs in Shopify):
+  - RSV-V-PRODUCTXYZ-S   (Small)
+  - RSV-V-PRODUCTXYZ-M   (Medium)
+  - RSV-V-PRODUCTXYZ-L   (Large)
+
+PIM Product SKU Label (internal only, NOT in Shopify):
+  - RSV-V-PRODUCTXYZ     (base name without size suffix)
+
+Google Drive Folder:
+  - RSV-V-PRODUCTXYZ/    (matches PIM product SKU label)
+
+Storj Media Bucket:
+  - products/RSV-V-PRODUCTXYZ/  (matches PIM product SKU label)
+```
+
+**Why this works:**
+- ✅ Human-readable grouping for products with variants
+- ✅ Matches existing Google Drive folder structure
+- ✅ Clear media organization (one bucket per product)
+- ✅ Easy to derive: strip size/color suffix from any variant SKU
+- ✅ Products table `sku_label` field stores this internal label
+- ⚠️ **Does not match any Shopify SKU** - only variants have SKUs in Shopify
+
+### How This Works in the Schema
+
+**Product-level media** (the default):
+```sql
+-- All media for RSV-B-FILLER-PLUG product
+SELECT ma.*
+FROM media_assets ma
+JOIN product_media pm ON pm.media_asset_id = ma.id
+WHERE pm.product_id = <product-uuid>
+  AND pm.variant_id IS NULL;  -- Product-level (shared by all variants)
+```
+
+**Variant hero images** (one per variant):
+```sql
+-- Set hero image for Medium size variant
+INSERT INTO product_media (
+  product_id: <product-uuid>,
+  media_asset_id: <specific-image-uuid>,
+  variant_id: <variant-M-uuid>,  -- Links to specific variant
+  association_type: 'variant_hero',
+  is_featured: TRUE
+);
+```
+
+### UI Workflow
+
+**Product Detail Page:**
+```
+Product: RSV-B-FILLER-PLUG
+Variants: M, L, XL
+
+[Shared Media Gallery] (7 images)
+  All variants can use any of these images
+  [Upload] [Edit] [Reorder]
+
+[Variant Hero Images]
+  M:  [Select from gallery ▼] → filler plug 3.jpg
+  L:  [Select from gallery ▼] → filler plug 4.jpg
+  XL: [Select from gallery ▼] → filler plug 5.jpg
+```
+
+**Import Examples:**
+
+**Example 1: Consolidation of variant-split folders**
+```
+Historical folders:
+  RSV-B-FILLER-PLUG-BLACK/
+  RSV-B-FILLER-PLUG-RED/
+
+Import as:
+  RSV-B-FILLER-PLUG/ (consolidated, matches internal SKU label)
+    ├── Photos/Raw Captures/        (from both folders)
+    ├── Photos/Final ECOM/          (from both folders)
+    └── ... all media in one bucket
+
+Then assign hero images:
+  Black variant (SKU: RSV-B-FILLER-PLUG-BLACK) → hero: black-photo.jpg
+  Red variant (SKU: RSV-B-FILLER-PLUG-RED) → hero: red-photo.jpg
+```
+
+**Example 2: Product with size variants**
+```
+Shopify product has variants:
+  - RSV-V-PRODUCTXYZ-S (Small)
+  - RSV-V-PRODUCTXYZ-M (Medium)
+  - RSV-V-PRODUCTXYZ-L (Large)
+
+Google Drive folder:
+  RSV-V-PRODUCTXYZ/  ← Note: no size suffix
+
+PIM system:
+  products.sku_label = "RSV-V-PRODUCTXYZ"
+  Media bucket: products/RSV-V-PRODUCTXYZ/
+
+All three variants share the same media pool and can each select their hero image.
+```
+
+### Benefits of This Approach
+
+1. **Shopify-aligned** - Matches Shopify's product/variant media model exactly
+2. **Simple** - One media pool, easy to browse
+3. **Flexible** - Can use any image for any variant
+4. **Hero selection** - Each variant gets its distinctive hero image
+5. **No duplication** - Shared images stored once, referenced multiple times
+6. **Easy consolidation** - Historical folder splits merge cleanly
+
 ## Open Questions / TBD
 
 1. **Collection Media**
    - Do you need collection management now or future phase?
    - Should collections be imported from Shopify?
 
-2. **Variant Options**
-   - How many option dimensions? (Shopify supports 3 max: option1, option2, option3)
-   - Should option names/values be editable in PIM?
-
-3. **Backup Strategy**
+2. **Backup Strategy**
    - Automated database backups via Supabase
    - Storj versioning enabled?
    - Point-in-time recovery requirements?
 
-4. **Monitoring & Alerts**
+3. **Monitoring & Alerts**
    - Error tracking (Sentry, LogRocket)?
    - Uptime monitoring?
    - Alert on sync failures?
