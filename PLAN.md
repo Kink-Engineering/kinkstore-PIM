@@ -99,7 +99,7 @@ CREATE TABLE products (
   status VARCHAR(50) DEFAULT 'draft', -- draft, active, archived
   shopify_status VARCHAR(50), -- ACTIVE, DRAFT, ARCHIVED (from Shopify)
   shopify_published_at TIMESTAMP,
-  metadata JSONB, -- flexible metafields storage
+  metadata JSONB, -- flexible metafields storage, includes things like KS ID product group.
   created_at TIMESTAMP DEFAULT NOW(),
   updated_at TIMESTAMP DEFAULT NOW(),
   last_synced_at TIMESTAMP,
@@ -244,9 +244,9 @@ CREATE TABLE media_assets (
   created_at TIMESTAMP DEFAULT NOW(),
   updated_at TIMESTAMP DEFAULT NOW(),
 
-  -- Import tracking
-  google_drive_file_id VARCHAR(255),
-  google_drive_folder_path VARCHAR(500), -- full path from Google Drive (e.g., "RSV-B-FILLER-PLUG/Photos/New Raw Captures")
+  -- Import tracking   --- KEPT HERE FOR LEGACY ONLY POST IMPORT.
+  google_drive_file_id VARCHAR(255),    --legacy
+  google_drive_folder_path VARCHAR(500), -- legacy full path from Google Drive (e.g., "RSV-B-FILLER-PLUG/Photos/New Raw Captures")
   import_source VARCHAR(255),
   import_batch_id UUID -- group all files from same import job
 );

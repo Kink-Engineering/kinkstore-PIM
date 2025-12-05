@@ -29,6 +29,12 @@ This system migrates from Google Drive-based media storage to a database-driven 
 - **[Implementation Plan](PLAN.md)** - Full 8-week implementation plan with phases, tasks, and technical details
 - **[Database Schema](database-schema.md)** - Entity relationship diagrams, table definitions, and query patterns
 
+## Project Management
+
+Track progress and tasks in Linear:
+
+- **[Join the Linear Project](https://linear.app/kink/join/7f0e466af27480fa999f862a2c0b07a6?s=5)** - View and collaborate on project tasks
+
 ## Key Concepts
 
 ### SKU Architecture
