@@ -5,12 +5,13 @@
 ```mermaid
 erDiagram
     products ||--o{ product_variants : "has many"
-    products ||--|| media_buckets : "has one"
+    products ||--|| media_buckets : "has one (organizational)"
 
-    media_buckets ||--o{ media_assets : "contains"
+    media_buckets ||--o{ media_assets : "contains (storage)"
 
-    product_variants ||--o{ product_media_associations : "may have hero"
-    media_assets ||--o{ product_media_associations : "optional metadata"
+    products ||--o{ product_media_associations : "publishing assignments"
+    product_variants ||--o{ product_media_associations : "variant hero (optional)"
+    media_assets ||--o{ product_media_associations : "assigned media"
 
     users ||--o{ media_assets : "uploads/edits"
     users ||--o{ sync_logs : "performs"
@@ -86,11 +87,12 @@ erDiagram
 
     product_media_associations {
         uuid id PK
-        uuid mediaAssetId FK
-        uuid variantId FK "NULL for product-level"
-        varchar associationType "variant_hero, product_gallery_order"
-        int position "Gallery ordering"
-        boolean isFeatured "Hero images"
+        uuid productId FK "Required - which product"
+        uuid mediaAssetId FK "Which media asset"
+        uuid variantId FK "NULL for product-level, set for variant hero"
+        varchar associationType "product_image, product_video, variant_hero"
+        int position "Gallery ordering (1 = hero for product-level)"
+        boolean isPublished "Whether to publish to Shopify"
     }
 
     users {
@@ -147,14 +149,18 @@ erDiagram
 - Query pattern: `SELECT * FROM media_assets WHERE media_bucket_id = ?`
 - If same image needed for multiple products, must copy the file (explicit duplication)
 
-### 4. Variant Hero Images (Optional Metadata via product_media_associations)
-- `product_media_associations` table stores ONLY optional metadata
-- Used for: variant hero images and gallery ordering
-- `variant_id` is NULL for product-level associations
-- `variant_id` is set for variant-specific hero images
-- Each variant can have ONE hero image selected from the bucket's media pool
-- `is_featured = TRUE` marks hero images
-- **Note**: This table does NOT establish bucket membership (that's via media_assets.media_bucket_id)
+### 4. Product Media Associations (Publishing Source of Truth)
+- **`product_media_associations` is the SOLE source of truth for what gets published to Shopify**
+- Media bucket membership (via `media_assets.media_bucket_id`) is purely organizational
+- Just because an image is in a product's bucket does NOT mean it gets published
+- This table explicitly defines:
+  - Which images are assigned to a product
+  - The order of images in the product gallery
+  - Which image is the hero (position = 1 for product-level)
+  - Which videos are associated with a product
+  - Variant-specific hero images (when `variant_id` is set)
+- **UI Behavior**: Images from the matching SKU bucket are highlighted/suggested, but users can choose any image
+- **Future flexibility**: Buckets may exist without products; publishing points may expand beyond products
 
 ### 5. Media Workflow States
 ```
@@ -198,40 +204,58 @@ Media Bucket:      products/UNIQUE-SKU-123/
 Google Drive:      UNIQUE-SKU-123/
 ```
 
-## Query Patterns via MediaBucket Class
+## Query Patterns
 
-### Get Media by Type
+### Bucket Queries (Organizational - What's in Storage)
 ```typescript
-// Get published assets for product
+// Get bucket by SKU label
 const bucket = await MediaBucket.findBySkuLabel('RSV-V-PRODUCTXYZ');
-const published = await bucket.getPublishedAssets();
 
-// Get raw sources
+// Get all assets in the bucket (for browsing/selection UI)
+const allAssets = await bucket.getAllAssets();
+
+// Get raw sources, edited, project files
 const raw = await bucket.getRawSources();
-
-// Get edited (ready for publish)
 const edited = await bucket.getEditedAssets();
-
-// Get project files (PSDs, etc.)
 const projects = await bucket.getProjectFiles();
-```
 
-### Variant Hero Images
-```typescript
-// Set variant hero image
-await bucket.setVariantHeroImage(variantId, imageAssetId);
-
-// Get hero for specific variant
-const hero = await bucket.getVariantHeroImage(variantId);
-```
-
-### Cached Statistics
-```typescript
-// Fast access without querying assets
+// Cached statistics (fast, no asset query needed)
 console.log(bucket.rawAssetCount);       // 10
 console.log(bucket.editedAssetCount);    // 7
-console.log(bucket.publishedAssetCount); // 5
 console.log(bucket.totalAssetCount);     // 22
+```
+
+### Publishing Queries (What Gets Published to Shopify)
+```typescript
+// Get images assigned to a product (ordered by position)
+const assignedImages = await ProductMediaAssociation.getProductImages(productId);
+// → Returns images in gallery order, position 1 = hero
+
+// Get hero image for product (position 1, variant_id NULL)
+const productHero = await ProductMediaAssociation.getProductHero(productId);
+
+// Get hero image for a specific variant
+const variantHero = await ProductMediaAssociation.getVariantHero(variantId);
+
+// Get all videos assigned to a product
+const videos = await ProductMediaAssociation.getProductVideos(productId);
+
+// Assign an image to a product
+await ProductMediaAssociation.assignImage(productId, mediaAssetId, position);
+
+// Set variant hero (uses image already assigned to product)
+await ProductMediaAssociation.setVariantHero(variantId, mediaAssetId);
+```
+
+### Key Distinction
+```typescript
+// Bucket: "What images exist in storage for this SKU?"
+const bucket = await MediaBucket.findBySkuLabel('RSV-V-PRODUCTXYZ');
+const available = await bucket.getAllAssets();  // 15 images in bucket
+
+// Associations: "Which images are assigned to this product?"
+const assigned = await ProductMediaAssociation.getProductImages(productId);  // 5 images assigned
+// These 5 are what get published to Shopify
 ```
 
 ## Storj Storage Structure
@@ -285,23 +309,28 @@ flowchart TD
 
 ```mermaid
 flowchart TD
-    A[User: Publish Product] --> B[Query bucket.getPublishedAssets<br/>SELECT * FROM media_assets<br/>WHERE media_bucket_id = ? AND workflow_state = 'published']
-    B --> C{Has Published Assets?}
-    C -->|No| D[Mark assets as ready_for_publish]
-    D --> E[Update workflow_state = published<br/>Trigger updates bucket counts]
-    C -->|Yes| E
+    A[User: Publish Product] --> B[Query product_media_associations<br/>SELECT * FROM product_media_associations<br/>WHERE product_id = ? AND is_published = true<br/>ORDER BY position]
+    B --> C{Has Assigned Media?}
+    C -->|No| D[Error: No media assigned to product]
+    C -->|Yes| E[Get media assets for assigned IDs]
 
     E --> F[Upload Media to Shopify<br/>via Admin GraphQL API]
-    F --> G[Associate Media with Product<br/>productCreateMedia mutation]
+    F --> G[Associate Media with Product<br/>productCreateMedia mutation<br/>Position 1 = Hero Image]
 
     G --> H{Variant Hero Images?}
-    H -->|Yes| I[Query variant hero images<br/>from product_media_associations<br/>where is_featured=true]
+    H -->|Yes| I[Query variant hero associations<br/>WHERE variant_id IS NOT NULL]
     I --> J[Associate Hero with Variant<br/>in Shopify]
 
     H -->|No| K[Complete]
     J --> K
 
     K --> L[Update sync_logs]
-    L --> M[Update products.last_synced_at<br/>Update media_buckets.last_publish_at]
+    L --> M[Update products.last_synced_at]
 ```
+
+### Publishing Logic Summary
+1. **Product images come from `product_media_associations`** (NOT from bucket directly)
+2. **Position 1 = product hero image** (also used as variant[0] hero if single variant)
+3. **Variant heroes are explicit associations** where `variant_id IS NOT NULL`
+4. **Bucket is just storage** - images must be explicitly assigned to be published
 

@@ -53,21 +53,27 @@ Videos:  raw → edited → encoding_submitted → encoded → ready_for_publish
   - Never collides with any variant SKU
 
 **Media Bucket Concept:**
-- A **media bucket** is a first-class entity representing ALL media associated with a SKU Label
+- A **media bucket** is a first-class entity representing ALL media STORED under a SKU Label
 - One bucket per product (one-to-one with SKU Label)
 - Bucket identifier = SKU Label (e.g., `RSV-PRODUCTXYZ`)
 - Contains: raw captures, edited photos, videos, project files (PSDs), all workflow stages
 - Physically stored in Storj at: `products/{sku_label}/`
-- Database representation:
-  - **`media_buckets` table**: First-class bucket entity with cached stats (raw count, edited count, etc.)
-  - **`media_assets.media_bucket_id`**: Direct foreign key establishing bucket membership (one asset = one bucket)
-  - **`product_media_associations` table**: Optional metadata for variant heroes and gallery ordering
-  - Query via `MediaBucket` class: `bucket.getPublishedAssets()`, `bucket.getRawSources()`, etc.
+- **IMPORTANT**: Bucket is for ORGANIZATION/STORAGE only, NOT publishing
 
-**Key Design Choice:**
-- Each media asset belongs to exactly ONE bucket (enforced by `NOT NULL` FK on `media_assets.media_bucket_id`)
-- No many-to-many relationship for basic bucket membership (simpler, clearer ownership)
-- If the same image is needed for multiple products, copy the file (rare scenario, explicit duplication)
+**Publishing is Separate from Bucket Membership:**
+- **`media_buckets` table**: Organizational container with cached stats
+- **`media_assets.media_bucket_id`**: Where the file is stored (organizational)
+- **`product_media_associations` table**: **SOURCE OF TRUTH for publishing** - defines what actually gets published to Shopify
+- Just because an image is in a bucket does NOT mean it gets published
+- Users must explicitly assign images from the bucket (or any bucket) to the product
+- UI highlights images from matching SKU bucket, but users can choose any image
+
+**Key Design Choices:**
+- Each media asset belongs to exactly ONE bucket (storage location)
+- Publishing is defined by `product_media_associations` (explicit assignments)
+- In the UI, images from the matching SKU bucket are highlighted/suggested
+- Users are free to assign images from other buckets if needed
+- **Future flexibility**: Buckets may exist without products; publishing points may expand beyond products
 
 ### Core Tables
 
@@ -252,31 +258,40 @@ CREATE INDEX idx_media_import_batch ON media_assets(import_batch_id);
 COMMENT ON COLUMN media_assets.media_bucket_id IS 'Foreign key to media_buckets. Each asset belongs to exactly one bucket (one product). NOT NULL enforces this constraint.';
 ```
 
-#### `product_media_associations` (Optional Metadata Table)
+#### `product_media_associations` (Publishing Source of Truth)
 ```sql
--- Optional table for special associations like variant hero images and gallery ordering
--- NOTE: Basic bucket membership is established via media_assets.media_bucket_id
--- This table is ONLY for additional metadata like "which image is the hero for variant X"
+-- THIS TABLE IS THE SOURCE OF TRUTH FOR WHAT GETS PUBLISHED TO SHOPIFY
+-- Bucket membership (media_assets.media_bucket_id) is purely organizational storage
+-- Just because an image is in a bucket does NOT mean it gets published
+-- This table explicitly defines what images/videos are assigned to each product
 CREATE TABLE product_media_associations (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  media_asset_id UUID NOT NULL REFERENCES media_assets(id) ON DELETE CASCADE,
-  variant_id UUID REFERENCES product_variants(id) ON DELETE CASCADE, -- NULL for product-level associations
-  association_type VARCHAR(50) NOT NULL, -- 'variant_hero', 'product_gallery_order'
-  position INTEGER DEFAULT 0, -- for ordering gallery images
-  is_featured BOOLEAN DEFAULT FALSE, -- marks variant hero images
+  product_id UUID NOT NULL REFERENCES products(id) ON DELETE CASCADE, -- Required: which product
+  media_asset_id UUID NOT NULL REFERENCES media_assets(id) ON DELETE CASCADE, -- Which media
+  variant_id UUID REFERENCES product_variants(id) ON DELETE CASCADE, -- NULL for product-level, set for variant hero
+  association_type VARCHAR(50) NOT NULL, -- 'product_image', 'product_video', 'variant_hero'
+  position INTEGER DEFAULT 0, -- Gallery ordering: 1 = hero image for product-level
+  is_published BOOLEAN DEFAULT TRUE, -- Whether to publish to Shopify
   created_at TIMESTAMP DEFAULT NOW(),
+  updated_at TIMESTAMP DEFAULT NOW(),
 
   -- A variant can only have one hero image
-  UNIQUE(variant_id, association_type) WHERE association_type = 'variant_hero' AND variant_id IS NOT NULL
+  UNIQUE(variant_id) WHERE variant_id IS NOT NULL AND association_type = 'variant_hero',
+  -- Prevent duplicate assignments of same media to same product
+  UNIQUE(product_id, media_asset_id, association_type)
 );
 
+CREATE INDEX idx_pma_product ON product_media_associations(product_id);
 CREATE INDEX idx_pma_asset ON product_media_associations(media_asset_id);
 CREATE INDEX idx_pma_variant ON product_media_associations(variant_id);
 CREATE INDEX idx_pma_type ON product_media_associations(association_type);
+CREATE INDEX idx_pma_position ON product_media_associations(product_id, position);
 
-COMMENT ON TABLE product_media_associations IS 'Optional metadata for special associations. Bucket membership is via media_assets.media_bucket_id. This table only tracks variant hero images and gallery ordering.';
-COMMENT ON COLUMN product_media_associations.variant_id IS 'For variant_hero type: which variant uses this asset as its hero image';
-COMMENT ON COLUMN product_media_associations.position IS 'For gallery ordering: display order in product gallery';
+COMMENT ON TABLE product_media_associations IS 'SOURCE OF TRUTH for publishing. Defines which images/videos are assigned to each product, their order, and variant heroes. Bucket membership is separate (organizational only).';
+COMMENT ON COLUMN product_media_associations.product_id IS 'Required: which product this media is assigned to';
+COMMENT ON COLUMN product_media_associations.variant_id IS 'NULL for product-level images; set for variant-specific hero images';
+COMMENT ON COLUMN product_media_associations.position IS 'Gallery order: position 1 = hero image (for product_image type)';
+COMMENT ON COLUMN product_media_associations.is_published IS 'If false, media is assigned but not published to Shopify';
 ```
 
 #### `media_buckets`
@@ -317,16 +332,20 @@ CREATE INDEX idx_media_buckets_sku_label ON media_buckets(sku_label);
 CREATE INDEX idx_media_buckets_status ON media_buckets(bucket_status);
 CREATE INDEX idx_media_buckets_import_batch ON media_buckets(import_batch_id);
 
-COMMENT ON TABLE media_buckets IS 'First-class media bucket entity. One bucket per product, identified by sku_label. Contains all media assets (raw, edited, published, project files) for that product.';
+COMMENT ON TABLE media_buckets IS 'Organizational storage container. One bucket per product, identified by sku_label. Contains all media assets (raw, edited, project files) for browsing/selection. NOTE: Bucket membership does NOT determine publishing - that is defined by product_media_associations.';
 COMMENT ON COLUMN media_buckets.sku_label IS 'Bucket identifier matching products.sku_label. For multi-variant: base SKU (e.g., RSV-V-PRODUCTXYZ). For single-variant: same as variant SKU.';
 COMMENT ON COLUMN media_buckets.storj_path IS 'Root path in Storj storage where all bucket assets are stored (e.g., products/RSV-V-PRODUCTXYZ/)';
+-- NOTE: published_asset_count refers to workflow_state, NOT whether assigned to a product
 ```
 
 **Relationship to `product_media_associations`:**
-- `media_buckets` is the **container** (one per product)
-- `media_assets.media_bucket_id` establishes **bucket membership** (one asset = one bucket)
-- `product_media_associations` is **optional metadata** (variant heroes, gallery ordering)
-- Query pattern: `bucket.getAssets()` → `SELECT * FROM media_assets WHERE media_bucket_id = bucket.id`
+- `media_buckets` is the **organizational storage container** (one per product)
+- `media_assets.media_bucket_id` establishes **where the file is stored** (organizational)
+- `product_media_associations` is the **PUBLISHING SOURCE OF TRUTH** - defines what gets published
+- **Bucket ≠ Published**: An image in a bucket is NOT automatically published
+- Query patterns:
+  - Bucket contents: `SELECT * FROM media_assets WHERE media_bucket_id = bucket.id`
+  - Published images: `SELECT * FROM product_media_associations WHERE product_id = ? ORDER BY position`
 
 **Triggers to maintain cached counts:**
 ```sql
@@ -1019,12 +1038,21 @@ INSERT INTO product_media (
 Product: RSV-B-FILLER-PLUG (SKU label)
 Shopify Product ID: 7891234567890
 
-[Edited Photos - Ready for Shopify] (7 images)
-  - filler plug 3.jpg
-  - filler plug 4.jpg
-  - filler plug 5.jpg
-  ...
-  [Reorder Gallery] [Upload New] [Edit Selected]
+[ASSIGNED TO PRODUCT - Will be Published] (5 images)
+  ★ filler plug 3.jpg (Hero - Position 1)
+  2. filler plug 4.jpg
+  3. filler plug 5.jpg
+  4. filler plug 6.jpg
+  5. filler plug 7.jpg
+  [Reorder Gallery] [Remove from Product] [Set as Hero]
+
+[MEDIA BUCKET - Available for Selection] (12 images total)
+  Images in bucket RSV-B-FILLER-PLUG/ (highlighted, suggested):
+    - filler plug 1.jpg [+ Assign]
+    - filler plug 2.jpg [+ Assign]
+    - DSC09935.jpg (raw) [+ Assign]
+    ...
+  [Browse All Buckets] [Upload New]
 
 [Raw Source Photos] (10 images) - collapsed by default
   Click to expand and browse all raw captures
@@ -1034,6 +1062,12 @@ Shopify Product ID: 7891234567890
   - filler plug 4 FA.psd
   [Download]
 ```
+
+**Key UI Behavior:**
+- "Assigned to Product" section shows what WILL be published (from `product_media_associations`)
+- "Media Bucket" section shows what's AVAILABLE (from `media_assets` in the bucket)
+- Images from the matching SKU bucket are highlighted/suggested
+- Users CAN assign images from other buckets if needed
 
 **Media Library - Product Filter View**
 ```
@@ -1096,11 +1130,12 @@ storj://kinkstore-pim/
 │           └── project/
 ```
 
-#### MediaBucket Class Interface
+#### Class Interfaces
 
-The `MediaBucket` domain class provides a high-level API for working with product media:
+**MediaBucket Class (Organizational/Storage)**
 
-**TypeScript/JavaScript Example:**
+The `MediaBucket` domain class provides API for browsing available media:
+
 ```typescript
 class MediaBucket {
   id: string;
@@ -1111,130 +1146,143 @@ class MediaBucket {
   // Cached counts (from media_buckets table)
   rawAssetCount: number;
   editedAssetCount: number;
-  publishedAssetCount: number;
   projectFileCount: number;
   totalAssetCount: number;
 
-  // Query methods
-  async getPublishedAssets(): Promise<MediaAsset[]>;
-  async getEditedAssets(): Promise<MediaAsset[]>;
-  async getRawSources(): Promise<MediaAsset[]>;
-  async getProjectFiles(): Promise<MediaAsset[]>;
+  // Query methods - what's IN the bucket (available for selection)
   async getAllAssets(): Promise<MediaAsset[]>;
+  async getEditedAssets(): Promise<MediaAsset[]>;  // workflow_state IN ('edited', 'ready_for_publish')
+  async getRawSources(): Promise<MediaAsset[]>;     // workflow_state = 'raw'
+  async getProjectFiles(): Promise<MediaAsset[]>;   // workflow_category = 'project_file'
 
   // Filtering
   async getAssetsByWorkflowState(state: WorkflowState): Promise<MediaAsset[]>;
   async getAssetsByType(type: 'image' | 'video'): Promise<MediaAsset[]>;
+}
+```
 
-  // Variant operations
-  async getVariantHeroImage(variantId: string): Promise<MediaAsset | null>;
-  async setVariantHeroImage(variantId: string, assetId: string): Promise<void>;
+**ProductMediaAssociation Class (Publishing/Assignment)**
 
-  // Bulk operations
-  async addAssets(assets: MediaAsset[], associationType: string): Promise<void>;
-  async removeAsset(assetId: string): Promise<void>;
+The `ProductMediaAssociation` class manages what gets published:
 
-  // Statistics
-  async getTotalSize(): Promise<number>;
-  async getAssetCountsByState(): Promise<Record<WorkflowState, number>>;
+```typescript
+class ProductMediaAssociation {
+  // Query what's ASSIGNED to a product (will be published)
+  static async getProductImages(productId: string): Promise<MediaAsset[]>;  // Ordered by position
+  static async getProductHero(productId: string): Promise<MediaAsset | null>;  // Position 1
+  static async getProductVideos(productId: string): Promise<MediaAsset[]>;
+  static async getVariantHero(variantId: string): Promise<MediaAsset | null>;
+
+  // Assignment operations
+  static async assignImage(productId: string, mediaAssetId: string, position: number): Promise<void>;
+  static async assignVideo(productId: string, mediaAssetId: string, position?: number): Promise<void>;
+  static async setVariantHero(productId: string, variantId: string, mediaAssetId: string): Promise<void>;
+  static async removeAssignment(associationId: string): Promise<void>;
+  static async reorderImages(productId: string, orderedAssetIds: string[]): Promise<void>;
 }
 ```
 
 **Usage Examples:**
 ```typescript
-// Get bucket by SKU label
+// BROWSING: Get available images from bucket
 const bucket = await MediaBucket.findBySkuLabel('RSV-V-PRODUCTXYZ');
+const availableImages = await bucket.getEditedAssets();
+console.log(`${availableImages.length} images available for selection`);
 
-// Query published assets
-const publishedAssets = await bucket.getPublishedAssets();
-// → Returns all assets with workflow_state = 'published'
+// PUBLISHING: Get what's assigned to product
+const assignedImages = await ProductMediaAssociation.getProductImages(productId);
+console.log(`${assignedImages.length} images will be published`);
 
-// Query edited (ready for publish) assets
-const editedAssets = await bucket.getEditedAssets();
-// → Returns all assets with workflow_state IN ('edited', 'ready_for_publish')
+// ASSIGNMENT: Add an image to the product
+await ProductMediaAssociation.assignImage(productId, mediaAssetId, 3);
 
-// Query raw sources
-const rawAssets = await bucket.getRawSources();
-// → Returns all assets with workflow_state = 'raw'
+// HERO: Set product hero (position 1)
+await ProductMediaAssociation.assignImage(productId, heroImageId, 1);
 
-// Get quick stats without querying assets
-console.log(`Bucket has ${bucket.rawAssetCount} raw, ${bucket.editedAssetCount} edited`);
-
-// Set variant hero image
-await bucket.setVariantHeroImage(variantId, heroImageAssetId);
+// VARIANT HERO: Set hero for a specific variant
+await ProductMediaAssociation.setVariantHero(productId, variantId, variantHeroImageId);
 ```
 
 #### Key SQL Queries
 
-**Get all media for a product (by type):**
+**PUBLISHING QUERIES (What gets published to Shopify):**
 ```sql
--- Via MediaBucket class: bucket.getEditedAssets()
+-- Get images ASSIGNED to a product (will be published)
+SELECT ma.*, pma.position
+FROM product_media_associations pma
+JOIN media_assets ma ON ma.id = pma.media_asset_id
+WHERE pma.product_id = '<product-uuid>'
+  AND pma.association_type = 'product_image'
+  AND pma.is_published = TRUE
+ORDER BY pma.position;
+-- Position 1 = Hero image
+
+-- Get product hero image
+SELECT ma.*
+FROM product_media_associations pma
+JOIN media_assets ma ON ma.id = pma.media_asset_id
+WHERE pma.product_id = '<product-uuid>'
+  AND pma.association_type = 'product_image'
+  AND pma.position = 1;
+
+-- Get variant hero image
+SELECT ma.*
+FROM product_media_associations pma
+JOIN media_assets ma ON ma.id = pma.media_asset_id
+WHERE pma.variant_id = '<variant-uuid>'
+  AND pma.association_type = 'variant_hero';
+
+-- Get videos assigned to a product
+SELECT ma.*, pma.position
+FROM product_media_associations pma
+JOIN media_assets ma ON ma.id = pma.media_asset_id
+WHERE pma.product_id = '<product-uuid>'
+  AND pma.association_type = 'product_video'
+ORDER BY pma.position;
+```
+
+**BUCKET QUERIES (What's available in storage):**
+```sql
+-- Get all assets in a bucket (for browsing/selection UI)
 SELECT ma.*
 FROM media_assets ma
-JOIN product_media pm ON pm.media_asset_id = ma.id
-JOIN media_buckets mb ON mb.product_id = pm.product_id
+JOIN media_buckets mb ON mb.id = ma.media_bucket_id
+WHERE mb.sku_label = 'RSV-V-PRODUCTXYZ'
+ORDER BY ma.workflow_state, ma.original_filename;
+
+-- Get edited assets available for assignment
+SELECT ma.*
+FROM media_assets ma
+JOIN media_buckets mb ON mb.id = ma.media_bucket_id
 WHERE mb.sku_label = 'RSV-V-PRODUCTXYZ'
   AND ma.workflow_state IN ('edited', 'ready_for_publish')
 ORDER BY ma.original_filename;
 
--- Via MediaBucket class: bucket.getRawSources()
+-- Get raw sources
 SELECT ma.*
 FROM media_assets ma
-JOIN product_media pm ON pm.media_asset_id = ma.id
-JOIN media_buckets mb ON mb.product_id = pm.product_id
+JOIN media_buckets mb ON mb.id = ma.media_bucket_id
 WHERE mb.sku_label = 'RSV-V-PRODUCTXYZ'
   AND ma.workflow_state = 'raw'
 ORDER BY ma.created_at;
 
--- Via MediaBucket class: bucket.getPublishedAssets()
-SELECT ma.*
-FROM media_assets ma
-JOIN product_media pm ON pm.media_asset_id = ma.id
-JOIN media_buckets mb ON mb.product_id = pm.product_id
-WHERE mb.sku_label = 'RSV-V-PRODUCTXYZ'
-  AND ma.workflow_state = 'published'
-ORDER BY pm.position;
-
--- Via MediaBucket class: bucket.getProjectFiles()
-SELECT ma.*
-FROM media_assets ma
-JOIN product_media pm ON pm.media_asset_id = ma.id
-WHERE pm.product_id = (SELECT product_id FROM media_buckets WHERE sku_label = 'RSV-V-PRODUCTXYZ')
-  AND ma.workflow_category = 'project_file';
-```
-
-**Get bucket by SKU label (with cached stats):**
-```sql
--- Fast lookup with pre-computed counts
+-- Get bucket stats (fast, cached)
 SELECT * FROM media_buckets WHERE sku_label = 'RSV-V-PRODUCTXYZ';
--- Returns: id, product_id, sku_label, raw_asset_count, edited_asset_count, etc.
 ```
 
-**Get all media sets for a product (summary):**
+**ASSIGNMENT OPERATIONS:**
 ```sql
-SELECT
-  p.title,
-  p.handle as sku_label,
-  COUNT(CASE WHEN ma.workflow_category = 'raw_capture' THEN 1 END) as raw_count,
-  COUNT(CASE WHEN ma.workflow_category = 'final_ecom' THEN 1 END) as edited_count,
-  COUNT(CASE WHEN ma.workflow_category = 'project_file' THEN 1 END) as project_count
-FROM products p
-LEFT JOIN product_media pm ON pm.product_id = p.id
-LEFT JOIN media_assets ma ON ma.id = pm.media_asset_id
-WHERE p.id = 'xxx'
-GROUP BY p.id, p.title, p.handle;
-```
+-- Assign an image to a product
+INSERT INTO product_media_associations (product_id, media_asset_id, association_type, position, is_published)
+VALUES ('<product-uuid>', '<media-asset-uuid>', 'product_image', 3, TRUE);
 
-**Find folder-level relationships:**
-```sql
--- What folder did these edited photos come from?
-SELECT DISTINCT source_folder_path, workflow_category
-FROM media_assets ma
-JOIN product_media pm ON pm.media_asset_id = ma.id
-WHERE pm.product_id = 'yyy'
-ORDER BY workflow_category;
+-- Set variant hero (from an image already assigned to the product)
+INSERT INTO product_media_associations (product_id, media_asset_id, variant_id, association_type, is_published)
+VALUES ('<product-uuid>', '<media-asset-uuid>', '<variant-uuid>', 'variant_hero', TRUE);
 
--- Result shows: "Raw came from 'Photos/New Raw Captures', Edited came from 'Photos/Final ECOM Product Photos/new version'"
+-- Reorder images (update positions)
+UPDATE product_media_associations SET position = 1 WHERE id = '<pma-uuid-1>';
+UPDATE product_media_associations SET position = 2 WHERE id = '<pma-uuid-2>';
 ```
 
 #### Benefits
@@ -1292,25 +1340,29 @@ Storj Media Bucket:
 
 ### How This Works in the Schema
 
-**Product-level media** (the default):
+**Product-level images** (assigned for publishing):
 ```sql
--- All media for RSV-B-FILLER-PLUG product
-SELECT ma.*
-FROM media_assets ma
-JOIN product_media pm ON pm.media_asset_id = ma.id
-WHERE pm.product_id = <product-uuid>
-  AND pm.variant_id IS NULL;  -- Product-level (shared by all variants)
+-- Get images assigned to a product (will be published to Shopify)
+SELECT ma.*, pma.position
+FROM product_media_associations pma
+JOIN media_assets ma ON ma.id = pma.media_asset_id
+WHERE pma.product_id = '<product-uuid>'
+  AND pma.association_type = 'product_image'
+ORDER BY pma.position;
+-- Position 1 = Hero image (also used as variant[0] hero for single-variant products)
 ```
 
 **Variant hero images** (one per variant):
 ```sql
 -- Set hero image for Medium size variant
-INSERT INTO product_media (
-  product_id: <product-uuid>,
-  media_asset_id: <specific-image-uuid>,
-  variant_id: <variant-M-uuid>,  -- Links to specific variant
-  association_type: 'variant_hero',
-  is_featured: TRUE
+INSERT INTO product_media_associations (
+  product_id, media_asset_id, variant_id, association_type, is_published
+) VALUES (
+  '<product-uuid>',
+  '<specific-image-uuid>',
+  '<variant-M-uuid>',
+  'variant_hero',
+  TRUE
 );
 ```
 
@@ -1321,15 +1373,27 @@ INSERT INTO product_media (
 Product: RSV-B-FILLER-PLUG
 Variants: M, L, XL
 
-[Shared Media Gallery] (7 images)
-  All variants can use any of these images
-  [Upload] [Edit] [Reorder]
+[ASSIGNED IMAGES - Will Publish to Shopify] (5 images)
+  ★ filler plug 3.jpg (Hero - Position 1)
+  2. filler plug 4.jpg
+  3. filler plug 5.jpg
+  4. filler plug 6.jpg
+  5. filler plug 7.jpg
+  [Reorder Gallery] [Remove]
+
+[AVAILABLE IN BUCKET RSV-B-FILLER-PLUG/] (12 images)
+  Suggested images from this SKU's bucket:
+  - DSC09935.jpg [+ Assign]
+  - DSC09936.jpg [+ Assign]
+  [Browse All Buckets]
 
 [Variant Hero Images]
-  M:  [Select from gallery ▼] → filler plug 3.jpg
-  L:  [Select from gallery ▼] → filler plug 4.jpg
-  XL: [Select from gallery ▼] → filler plug 5.jpg
+  M:  [Select from assigned ▼] → filler plug 3.jpg
+  L:  [Select from assigned ▼] → filler plug 4.jpg
+  XL: [Select from assigned ▼] → filler plug 5.jpg
 ```
+
+**Important**: Variant heroes must be selected from images already assigned to the product.
 
 **Import Examples:**
 
@@ -1370,11 +1434,12 @@ All three variants share the same media pool and can each select their hero imag
 ### Benefits of This Approach
 
 1. **Shopify-aligned** - Matches Shopify's product/variant media model exactly
-2. **Simple** - One media pool, easy to browse
-3. **Flexible** - Can use any image for any variant
+2. **Explicit publishing** - Clear distinction between "available" (bucket) and "assigned" (will publish)
+3. **Flexible** - Can assign images from any bucket, not just the matching SKU
 4. **Hero selection** - Each variant gets its distinctive hero image
 5. **No duplication** - Shared images stored once, referenced multiple times
 6. **Easy consolidation** - Historical folder splits merge cleanly
+7. **Future-proof** - Buckets can exist without products; publishing points can expand
 
 ## Open Questions / TBD
 
@@ -1423,6 +1488,9 @@ Once this plan is approved:
 
 ---
 
-**Plan Version**: 1.0
-**Last Updated**: 2025-12-03
+**Plan Version**: 1.1
+**Last Updated**: 2025-12-05
 **Status**: Awaiting Approval
+
+### Changelog
+- **v1.1** (2025-12-05): Clarified that `product_media_associations` is the source of truth for publishing. Bucket membership is now purely organizational; images must be explicitly assigned to be published. Added `product_id` as required field on associations. Updated UI patterns to show "Assigned" vs "Available" sections.
