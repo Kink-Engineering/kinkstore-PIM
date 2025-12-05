@@ -6,15 +6,25 @@ A Product Information Management (PIM) system for managing ~1,000 products with 
 
  The Kinkstore PIM project in-houses the product catalog from shopify (products and product variants), pulls in the images and image editing workflow currently done in google drive in SKU folders (currently Meghan shooting, alva editing and James publishing ), pulls in video management and encoding (currently megan posting raw, someone editing, meghan currently pushes to encode and someone else publishes resulting link to shopify), and marries all this into one interface where the user can see, create, detete, edit all the products and the associated media, create and manage new media, assign media to products, and publish/remove products from shopify etc.
 
- The hierarchy and labelling associated with storage closely mimics the existing google drive folder naming conventions so as to provide continuity.
-
-This system migrates from Google Drive-based media storage to a database-driven solution with cloud storage (Storj), providing:
+ The hierarchy and labelling associated with storage closely mimics the existing google drive folder naming conventions so as to provide continuity. 
+ 
+ In Summary, this system migrates media from the Google Drive-based media storage to a database-driven solution with cloud storage (Storj), providing:
 
 - **Product Management**: Import and sync products/variants from Shopify
 - **Media Management**: Upload, organize, and edit images and videos
 - **Publishing Workflow**: Assign media to products and publish to Shopify
 - **Video Encoding**: Integration with external video encoding service
 - **Role-Based Access**: Admin, photographer, writer, and viewer roles
+
+## Exclusions
+
+The following is not currently in scope
+
+- **Collections**: Products in this system are assigned Meta data indicating categorization via Jame's dewie decimal system. Administration of collections depending on this data remains in shopify for now
+- **Bundles** : The existing bundles plug-in has no API and thus bundling of products remains in shopify. Nevertheless, once a bundle exists in shopify, it will be exported to this system for editing and mapping of media assets.
+- **Blog** : No thought has yet been given to how this system will interact with the blog system, if at all. If relevant blog articles can be pulled onto product pages via liquid code, we likely do not need an integration.
+- **Other Pages** : collection pages, landing pages, specialized pages are all out of scope.
+ 
 
 ## Tech Stack
 
