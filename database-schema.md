@@ -142,12 +142,12 @@ erDiagram
 - Bucket contains cached statistics (raw count, edited count, etc.)
 - Physical storage at `products/{sku_label}/` in Storj
 
-### 3. Media Bucket ↔ Media Assets (One-to-Many) **[KEY CHANGE]**
-- **Each asset belongs to exactly ONE bucket** via `media_assets.media_bucket_id` (NOT NULL FK)
-- Direct foreign key relationship (no junction table needed for basic membership)
-- Enforces clear ownership: one asset = one product bucket
+### 3. Media Bucket ↔ Media Assets (One-to-Many)
+- **Each asset is STORED in exactly ONE bucket** via `media_assets.media_bucket_id` (NOT NULL FK)
+- Direct foreign key relationship (no junction table needed for storage location)
+- Enforces clear storage ownership: one asset file = one bucket location
 - Query pattern: `SELECT * FROM media_assets WHERE media_bucket_id = ?`
-- If same image needed for multiple products, must copy the file (explicit duplication)
+- **NOTE**: An asset can be ASSIGNED to multiple products via `product_media_associations` (no file duplication needed)
 
 ### 4. Product Media Associations (Publishing Source of Truth)
 - **`product_media_associations` is the SOLE source of truth for what gets published to Shopify**
