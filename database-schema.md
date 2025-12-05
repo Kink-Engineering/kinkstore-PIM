@@ -80,8 +80,8 @@ erDiagram
         varchar workflowCategory "raw_capture, final_ecom, project_file"
         uuid uploadedBy FK
         uuid editedBy FK
-        varchar googleDriveFileId
-        varchar googleDriveFolderPath
+        varchar googleDriveFileId "LEGACY - import reference only"
+        varchar googleDriveFolderPath "LEGACY - import reference only"
         uuid importBatchId
     }
 
@@ -191,8 +191,8 @@ Variant SKUs:      "RSV-V-PRODUCTXYZ-S"      ← Real Shopify SKU
                    "RSV-V-PRODUCTXYZ-M"      ← Real Shopify SKU
                    "RSV-V-PRODUCTXYZ-L"      ← Real Shopify SKU
 
-Media Bucket:      products/RSV-V-PRODUCTXYZ/
-Google Drive:      RSV-V-PRODUCTXYZ/
+Media Bucket:      products/RSV-V-PRODUCTXYZ/  (Storj - permanent storage)
+Google Drive:      RSV-V-PRODUCTXYZ/           (LEGACY - import source only)
 ```
 
 #### Single-Variant Product
@@ -200,8 +200,8 @@ Google Drive:      RSV-V-PRODUCTXYZ/
 Product sku_label: "UNIQUE-SKU-123"          ← Internal label
 Variant SKU:       "UNIQUE-SKU-123"          ← Real Shopify SKU (same is OK)
 
-Media Bucket:      products/UNIQUE-SKU-123/
-Google Drive:      UNIQUE-SKU-123/
+Media Bucket:      products/UNIQUE-SKU-123/    (Storj - permanent storage)
+Google Drive:      UNIQUE-SKU-123/             (LEGACY - import source only)
 ```
 
 ## Query Patterns
@@ -282,9 +282,16 @@ storj://kinkstore-pim/
 
 ## Import Flow
 
+**Google Drive is for ONE-TIME IMPORT ONLY:**
+- Google Drive folders are the **source** for initial media migration
+- Files are copied to Storj (permanent storage) during import
+- Google Drive file/folder IDs are stored as **legacy reference** only
+- After import, Google Drive is NOT used for ongoing operations
+- All future media management happens in PIM → Storj → Shopify
+
 ```mermaid
 flowchart TD
-    A[Google Drive Folder<br/>RSV-V-PRODUCTXYZ/] --> B[Map to Shopify Product ID]
+    A[Google Drive Folder<br/>RSV-V-PRODUCTXYZ/<br/>ONE-TIME IMPORT SOURCE] --> B[Map to Shopify Product ID]
     B --> C[Create/Update Product Record<br/>sku_label = RSV-V-PRODUCTXYZ]
     C --> D[Create Media Bucket<br/>storj_path = products/RSV-V-PRODUCTXYZ/]
     D --> E[Import Files by Folder Type]
@@ -302,7 +309,8 @@ flowchart TD
     I --> J
 
     J --> K[Trigger Auto-Updates<br/>media_buckets Cached Counts]
-    K --> L[Import Complete]
+    K --> L[Store Google Drive IDs<br/>as legacy reference]
+    L --> M[Import Complete<br/>Google Drive no longer needed]
 ```
 
 ## Publish to Shopify Flow
