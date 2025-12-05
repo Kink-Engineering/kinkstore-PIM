@@ -87,7 +87,8 @@ CREATE TABLE products (
   description_html TEXT,
   handle VARCHAR(255),
   sku_label VARCHAR(255), -- descriptive SKU for human reference (e.g., "RSV-V-PRODUCTXYZ")
-                          -- NOTE: This is NOT a Shopify SKU (those live on variants)
+                          -- NOTE: If this is a single variant product this is the same as the associates variant SKU, as well as the shopify SKU.
+                          -- For a multi-variant product, this is NOT a Shopify SKU (those live on variants)
                           -- This is an internal label derived from variant SKUs by removing size suffix
                           -- Example: variants have "RSV-V-PRODUCTXYZ-S", "RSV-V-PRODUCTXYZ-M", "RSV-V-PRODUCTXYZ-L"
                           --          product sku_label is "RSV-V-PRODUCTXYZ" (does not exist in Shopify)

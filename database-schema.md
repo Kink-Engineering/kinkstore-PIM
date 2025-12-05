@@ -26,10 +26,13 @@ erDiagram
         varchar vendor
         varchar product_type
         text[] tags
-        varchar status
+        varchar status "PIM status: draft, active, archived"
+        varchar shopify_status "Shopify: ACTIVE, DRAFT, ARCHIVED"
+        timestamp shopify_published_at "When published to Shopify"
         jsonb metadata "Shopify metafields (see below)"
         timestamp created_at
         timestamp updated_at
+        timestamp last_synced_at "Last sync with Shopify"
     }
 
     product_variants {
@@ -200,6 +203,103 @@ Videos:  raw → edited → encoding_submitted → encoded → ready_for_publish
 - `final_ecom`: Edited, ready for ecommerce
 - `project_file`: PSDs, project files
 - `psd_cutout`: Photoshop cutouts
+
+## Product Status & Publishing Workflow
+
+### Two Status Fields
+
+Products have **two separate status fields** to track PIM state vs Shopify state:
+
+| Field | Source | Values | Purpose |
+|-------|--------|--------|---------|
+| `status` | PIM (internal) | `draft`, `active`, `archived` | Internal workflow state |
+| `shopify_status` | Shopify (synced) | `ACTIVE`, `DRAFT`, `ARCHIVED` | Current state in Shopify |
+
+### Status Definitions
+
+**PIM Status (`status`):**
+| Value | Meaning |
+|-------|---------|
+| `draft` | Work in progress - not ready for Shopify |
+| `active` | Ready/published - actively managed |
+| `archived` | No longer active - hidden from default views |
+
+**Shopify Status (`shopify_status`):**
+| Value | Meaning |
+|-------|---------|
+| `ACTIVE` | Published and visible on storefront |
+| `DRAFT` | Exists in Shopify but not visible |
+| `ARCHIVED` | Hidden from storefront and admin by default |
+
+### Publishing Workflow
+
+```mermaid
+flowchart LR
+    subgraph PIM["PIM System"]
+        A[Create/Import Product<br/>status: draft] --> B[Add Media<br/>Assign to Product]
+        B --> C[Review & Edit<br/>Set metadata]
+        C --> D[Mark Ready<br/>status: active]
+    end
+    
+    subgraph Shopify["Shopify"]
+        E[Draft in Shopify<br/>shopify_status: DRAFT]
+        F[Published<br/>shopify_status: ACTIVE]
+    end
+    
+    D -->|"Publish to Shopify<br/>(first time)"| E
+    D -->|"Publish & Activate"| F
+    E -->|"Activate in Shopify"| F
+```
+
+### Common Scenarios
+
+| Scenario | `status` | `shopify_status` | Description |
+|----------|----------|------------------|-------------|
+| New product being set up | `draft` | `NULL` | Not yet sent to Shopify |
+| Ready but not published | `active` | `NULL` | Ready in PIM, not in Shopify yet |
+| Published as draft | `active` | `DRAFT` | In Shopify but hidden |
+| Live on storefront | `active` | `ACTIVE` | Fully published and visible |
+| Discontinued | `archived` | `ARCHIVED` | No longer sold |
+| Seasonal (hidden) | `active` | `DRAFT` | Temporarily hidden |
+
+### Filtering Products by Status
+
+```sql
+-- Products ready to publish (in PIM but not in Shopify)
+SELECT * FROM products 
+WHERE status = 'active' AND shopify_status IS NULL;
+
+-- Products live on storefront
+SELECT * FROM products 
+WHERE shopify_status = 'ACTIVE';
+
+-- Products in staging (in Shopify as draft)
+SELECT * FROM products 
+WHERE shopify_status = 'DRAFT';
+
+-- All active products in PIM (regardless of Shopify state)
+SELECT * FROM products 
+WHERE status = 'active';
+
+-- Products needing attention (PIM archived but still live in Shopify)
+SELECT * FROM products 
+WHERE status = 'archived' AND shopify_status = 'ACTIVE';
+```
+
+### Sync Behavior
+
+| Action | Effect on `status` | Effect on `shopify_status` |
+|--------|-------------------|---------------------------|
+| Import from Shopify | Set to `active` | Synced from Shopify |
+| Edit in PIM | No change | No change (until sync) |
+| Publish to Shopify | No change | Updated after sync |
+| Archive in PIM | Set to `archived` | No change (manual sync needed) |
+| Change in Shopify | No change | Updated on next import/sync |
+
+**Conflict Resolution**: If a product is edited in both PIM and Shopify:
+- PIM is source of truth for media assignments
+- Shopify is source of truth for inventory/pricing
+- Metadata conflicts: PIM wins on publish, Shopify wins on import (configurable)
 
 ## SKU Architecture
 
