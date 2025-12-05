@@ -198,11 +198,12 @@ Google Drive:      RSV-V-PRODUCTXYZ/           (LEGACY - import source only)
 #### Single-Variant Product
 ```
 Product sku_label: "UNIQUE-SKU-123"          ← Internal label
-Variant SKU:       "UNIQUE-SKU-123"          ← Real Shopify SKU (same is OK)
+Variant SKU:       "UNIQUE-SKU-123"          ← Real Shopify SKU (MUST match sku_label)
 
 Media Bucket:      products/UNIQUE-SKU-123/    (Storj - permanent storage)
 Google Drive:      UNIQUE-SKU-123/             (LEGACY - import source only)
 ```
+**Note**: For single-variant products, the variant SKU and product sku_label MUST be identical. This is how the system matches the media bucket to suggest which assets to publish.
 
 ## Query Patterns
 
