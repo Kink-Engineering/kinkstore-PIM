@@ -142,7 +142,7 @@ CREATE UNIQUE INDEX idx_variants_sku_unique ON product_variants(sku) WHERE sku I
 - `products.sku_label` unique per product
 - `product_variants.sku` unique per variant
 - Single-variant products: `sku_label` must equal the sole variant `sku` (enforced)
-- Cross-table collisions are allowed (variant SKU may equal another product's sku_label)
+- Cross-product collisions are blocked: a variant SKU cannot equal another product's sku_label (and vice versa); single-product equality is allowed
 - `media_buckets.sku_label` unique; matches product sku_label
 
 **Why this matters:**

@@ -338,7 +338,7 @@ WHERE status = 'archived' AND shopify_status = 'ACTIVE';
 - `products.sku_label` is unique per product.
 - `product_variants.sku` is unique per variant.
 - Single-variant products: `sku_label` **must equal** the sole variant `sku` (enforced by trigger).
-- Cross-table collisions are allowed (a variant SKU may equal another product's sku_label); no cross-table trigger blocks this now.
+- Cross-product collisions are blocked: a variant SKU cannot equal another product's sku_label (and vice versa). The single-variant equality (same product) remains allowed.
 - `media_buckets.sku_label` is unique and matches the product sku_label for bucket identity.
 
 ### Examples

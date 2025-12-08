@@ -144,7 +144,7 @@ Final polish, admin tools, and UX improvements.
 - **Product `sku_label`**: Internal identifier (e.g., `RSV-V-PRODUCTXYZ`), unique per product
 - **Variant `sku`**: Actual Shopify SKU (e.g., `RSV-V-PRODUCTXYZ-S`, `RSV-V-PRODUCTXYZ-M`), unique per variant
 - Single-variant products: `sku_label` must equal the sole `variant.sku` (enforced)
-- Cross-table collisions are allowed (a variant SKU may equal another product's sku_label); `media_buckets.sku_label` remains unique per product
+- Cross-product collisions are blocked: a variant SKU cannot equal another product's sku_label (and vice versa); `media_buckets.sku_label` remains unique per product
 
 ### Media Buckets vs Publishing
 - **Media Buckets**: Organizational storage containers (one per product)
