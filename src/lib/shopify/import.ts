@@ -100,6 +100,13 @@ async function importProduct(
   const skuLabel = deriveSkuLabel(product.variants)
   const metadata = convertMetafields(product.metafields)
 
+  // Fetch existing sku_label (for logging/debug)
+  const { data: existingProduct } = await supabase
+    .from('products')
+    .select('sku_label')
+    .eq('shopify_product_id', shopifyProductId)
+    .maybeSingle()
+
   // Upsert product
   const { data: productData, error: productError } = await supabase
     .from('products')
@@ -125,6 +132,13 @@ async function importProduct(
     .single()
 
   if (productError) {
+    console.error('Product upsert failed', {
+      shopify_product_id: shopifyProductId,
+      title: product.title,
+      sku_label_new: skuLabel,
+      sku_label_existing: existingProduct?.sku_label ?? null,
+      error: productError.message,
+    })
     throw new Error(`Failed to upsert product: ${productError.message}`)
   }
 
