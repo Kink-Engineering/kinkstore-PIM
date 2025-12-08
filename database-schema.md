@@ -89,6 +89,26 @@ erDiagram
         uuid import_batch_id
     }
 
+    %% Staging for Shopify-published, unassociated images
+    product_images_unassociated {
+        uuid id PK "Primary Key"
+        varchar shopify_media_id UK "UNIQUE - Shopify MediaImage GID"
+        bigint shopify_product_id "Shopify Product ID (GID numeric)"
+        uuid product_id FK "FK -> products.id, optional"
+        varchar source_url "Original Shopify CDN URL"
+        varchar filename
+        text alt_text
+        varchar mime_type
+        bigint byte_size
+        int width
+        int height
+        int position "Gallery order from Shopify"
+        timestamp shopify_created_at
+        timestamp shopify_updated_at
+        timestamp created_at
+        timestamp updated_at
+    }
+
     product_media_associations {
         uuid id PK "Primary Key"
         uuid product_id FK "FK -> products.id, NOT NULL"
@@ -196,6 +216,12 @@ The following **product-level metafields** are used in Shopify and stored in `pr
   - Detecting drift between PIM and Shopify
 - **UI Behavior**: Images from the SKU bucket matching the product are highlighted/suggested for publication, but users can choose any image from any bucket.
 - **Future flexibility**: Buckets may exist without products (example unique label "LEATHER SHOTS"); publishing points may later expand beyond products
+
+### 4. Staged Shopify Media (Unassociated)
+- `product_images_unassociated` holds images already published in Shopify but not yet associated in our PIM.
+- We DO NOT place these into `media_assets`/Storj until after Google Drive migration; this avoids mixing staged Shopify media with bucket storage.
+- Key fields: `shopify_media_id` (unique), `shopify_product_id`, `source_url`, filename, alt text, mime, width/height, byte_size, position, timestamps.
+- Later, Phase 5b can use this table plus `product_media_associations.shopify_media_id` to create proper associations.
 
 ### 5. Media Workflow States
 ```

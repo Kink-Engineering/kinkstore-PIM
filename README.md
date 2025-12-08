@@ -107,6 +107,8 @@ Populate `product_media_associations` based on what's already published in Shopi
 | 5b.1 Image Association Population | Query Shopify, match filenames, create associations | [KIN-36](https://linear.app/kink/issue/KIN-36) |
 | 5b.2 Video Association Population | Query encoding API, parse descriptions, create associations | [KIN-37](https://linear.app/kink/issue/KIN-37) |
 
+**Shopify media staging:** Published Shopify images are staged in a dedicated table `product_images_unassociated` (not in Storj/`media_assets`) to keep bucket storage clean until Google Drive import is complete. This staging data is used for Phase 5b matching and association.
+
 ### Phase 6: Video Encoding Integration (Week 6)
 Handle video encoding workflow with external service.
 

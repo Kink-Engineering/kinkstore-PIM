@@ -1122,6 +1122,30 @@ INSERT INTO product_media (
 );
 ```
 
+#### `product_images_unassociated` (Shopify-published, not yet associated)
+```sql
+CREATE TABLE product_images_unassociated (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  shopify_media_id VARCHAR(255) UNIQUE NOT NULL,
+  shopify_product_id BIGINT,
+  product_id UUID REFERENCES products(id) ON DELETE CASCADE,
+  source_url VARCHAR(1000),
+  filename VARCHAR(500),
+  alt_text TEXT,
+  mime_type VARCHAR(100),
+  byte_size BIGINT,
+  width INT,
+  height INT,
+  position INT,
+  shopify_created_at TIMESTAMP,
+  shopify_updated_at TIMESTAMP,
+  created_at TIMESTAMP DEFAULT NOW(),
+  updated_at TIMESTAMP DEFAULT NOW()
+);
+```
+
+**Rationale:** This staging table keeps Shopify-published images separate from Storj bucket storage (`media_assets`). We ingest Shopify media metadata here during import/backfill, then later use `shopify_media_id` to associate or promote into the main publishing flow without mixing staged data into buckets.
+
 **That's it!** No complex linking, no version tracking, no parent-child relationships.
 
 #### UI/UX for Asset Management
