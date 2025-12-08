@@ -210,7 +210,7 @@ export async function importAllProducts(
 
   onProgress?.(progress, null)
   if (logId) {
-    await updateSyncLog(supabase, logId, 'running', progress, null)
+    await updateSyncLog(supabase, logId, 'partial', progress, null, true)
   }
 
   // Paginate through all products
@@ -240,7 +240,7 @@ export async function importAllProducts(
         processedSinceLastReport++
         onProgress?.(progress, errorMessage)
         if (logId) {
-          await updateSyncLog(supabase, logId, 'running', progress, errorMessage)
+          await updateSyncLog(supabase, logId, 'partial', progress, errorMessage, true)
         }
       }
     }
@@ -248,7 +248,7 @@ export async function importAllProducts(
     if (processedSinceLastReport >= progressEvery) {
       onProgress?.(progress, null)
       if (logId) {
-        await updateSyncLog(supabase, logId, 'running', progress, null)
+        await updateSyncLog(supabase, logId, 'partial', progress, null, true)
       }
       processedSinceLastReport = 0
     }
@@ -260,7 +260,8 @@ export async function importAllProducts(
       logId,
       progress.errors.length === 0 ? 'success' : 'partial',
       progress,
-      null
+      null,
+      false
     )
   } else {
     // Log sync (legacy)
@@ -365,7 +366,8 @@ async function updateSyncLog(
   logId: string,
   status: string,
   progress: ImportProgress,
-  lastError: string | null
+  lastError: string | null,
+  inProgress?: boolean
 ) {
   await supabase
     .from('sync_logs')
@@ -377,6 +379,7 @@ async function updateSyncLog(
         skipped: progress.skipped,
         errors: progress.errors.length,
         lastError,
+        in_progress: inProgress ?? false,
       },
       updated_at: new Date().toISOString(),
     })

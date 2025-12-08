@@ -32,8 +32,8 @@ export async function POST() {
       .insert({
         sync_type: 'import_from_shopify',
         entity_type: 'product',
-        status: 'running',
-        details: { total: null, imported: 0, errors: 0 },
+        status: 'partial', // using partial to satisfy check constraint; in_progress flag tracks running
+        details: { total: null, imported: 0, errors: 0, in_progress: true },
         performed_by: null,
       })
       .select('id')
@@ -78,7 +78,8 @@ export async function GET() {
       .from('sync_logs')
       .select('*')
       .eq('sync_type', 'import_from_shopify')
-      .eq('status', 'running')
+      .eq('status', 'partial')
+      .contains('details', { in_progress: true })
       .order('created_at', { ascending: false })
       .limit(1)
       .maybeSingle()
@@ -88,6 +89,7 @@ export async function GET() {
       .select('*')
       .eq('sync_type', 'import_from_shopify')
       .in('status', ['success', 'partial', 'failed'])
+      .or('details->>in_progress.is.null,details->>in_progress.eq.false')
       .order('created_at', { ascending: false })
       .limit(1)
       .maybeSingle()
