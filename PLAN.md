@@ -29,11 +29,9 @@ Building a Product Information Management (PIM) system for ~1,000 products with 
 - **Central Media Library**: All images/videos stored once in media table
 - **Association Model**: Many-to-many relationships via junction tables
 - **Use Cases Supported**:
-  - Product-level media (hero images, galleries)
-  - Variant-level media (specific to size/color variants)
-  - Collection-level media (future: collection hero images)
-  - Shared media across products (bundles)
-
+  - Product-level media (hero image, other ordered images)
+  - Variant-level media (1 image from product-level images tagged as hero per variant)
+ 
 #### 3. Media Workflow States
 ```
 Images:  raw → edited → ready_for_publish → published
@@ -47,7 +45,7 @@ Videos:  raw → edited → encoding_submitted → encoded → ready_for_publish
 **SKU vs SKU Label:**
 - **SKU**: Exists at variant level only (Shopify reality). Example: `RSV-PRODUCTXYZ-S`, `RSV-PRODUCTXYZ-M`
 - **SKU Label**: Exists at product level (PIM internal). Example: `RSV-PRODUCTXYZ`
-  - For multi-variant products: base name without size/color suffix
+  - For multi-variant products: base name without size/color suffix (NOTE this is not a shopify sku)
   - For single-variant products: same as the variant's SKU
   - Always unique across all products
   - Never collides with any variant SKU
@@ -291,7 +289,7 @@ CREATE INDEX idx_pma_asset ON product_media_associations(media_asset_id);
 CREATE INDEX idx_pma_variant ON product_media_associations(variant_id);
 CREATE INDEX idx_pma_type ON product_media_associations(association_type);
 CREATE INDEX idx_pma_position ON product_media_associations(product_id, position);
-CREATE INDEX idx_pma_shopify_media ON product_media_associations(shopify_media_id);
+CREATE UNIQUE INDEX idx_pma_shopify_media_unique ON product_media_associations(shopify_media_id) WHERE shopify_media_id IS NOT NULL;
 
 COMMENT ON TABLE product_media_associations IS 'SOURCE OF TRUTH for publishing. Defines which images/videos are assigned to each product, their order, and variant heroes. Bucket membership is separate (organizational only).';
 COMMENT ON COLUMN product_media_associations.product_id IS 'Required: which product this media is assigned to';

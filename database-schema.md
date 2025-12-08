@@ -97,7 +97,7 @@ erDiagram
         varchar association_type "NOT NULL: product_image, product_video, variant_hero"
         int position "Gallery order (1 = hero)"
         boolean is_published "Default: true"
-        varchar shopify_media_id "Shopify MediaImage GID - NULL until synced"
+        varchar shopify_media_id UK "UNIQUE when NOT NULL - Shopify MediaImage GID"
         constraint uk_product_media UK "UNIQUE(product_id, media_asset_id, association_type)"
         constraint uk_variant_hero UK "UNIQUE(variant_id) WHERE variant_hero"
     }
