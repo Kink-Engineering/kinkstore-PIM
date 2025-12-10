@@ -23,7 +23,16 @@ interface ImportProgress {
   total: number
   imported: number
   skipped: number
-  errors: Array<{ productId: string; error: string }>
+  errors: Array<{
+    productId: string
+    shopifyProductId?: number
+    title?: string
+    scope?: 'product' | 'variant' | 'media'
+    variantId?: string
+    variantSku?: string | null
+    shopifyVariantId?: number | null
+    message: string
+  }>
 }
 
 interface ImportResult {
@@ -59,7 +68,14 @@ function convertMetafields(
  */
 async function importProduct(
   supabase: SupabaseClient,
-  product: ShopifyProduct
+  product: ShopifyProduct,
+  recordError?: (error: {
+    message: string
+    scope?: 'product' | 'variant' | 'media'
+    variantId?: string
+    variantSku?: string | null
+    shopifyVariantId?: number | null
+  }) => void
 ): Promise<void> {
   const shopifyProductId = extractShopifyId(product.id)
   const skuLabel =
@@ -99,6 +115,10 @@ async function importProduct(
     .single()
 
   if (productError) {
+    recordError?.({
+      message: productError.message,
+      scope: 'product',
+    })
     console.error('Product upsert failed', {
       shopify_product_id: shopifyProductId,
       title: product.title,
@@ -111,8 +131,8 @@ async function importProduct(
 
   const productId = productData.id
 
-  await upsertShopifyMedia(supabase, product, productId, shopifyProductId)
-  await upsertVariantHeroMedia(supabase, product, productId)
+  await upsertShopifyMedia(supabase, product, productId, shopifyProductId, recordError)
+  await upsertVariantHeroMedia(supabase, product, productId, recordError)
 
   // Upsert variants
   for (const { node: variant } of product.variants.edges) {
@@ -141,6 +161,13 @@ async function importProduct(
       })
 
     if (variantError) {
+      recordError?.({
+        message: variantError.message,
+        scope: 'variant',
+        variantId: variant.id,
+        variantSku: variant.sku,
+        shopifyVariantId,
+      })
       console.error(`Failed to upsert variant ${shopifyVariantId}:`, variantError.message)
     }
   }
@@ -210,7 +237,30 @@ export async function importAllProducts(
     for (const product of products) {
       const shopifyProductId = extractShopifyId(product.id)
       try {
-        await importProduct(supabase, product)
+        const recordError = (err: {
+          message: string
+          scope?: 'product' | 'variant' | 'media'
+          variantId?: string
+          variantSku?: string | null
+          shopifyVariantId?: number | null
+        }) => {
+          progress.errors.push({
+            productId: product.id,
+            shopifyProductId,
+            title: product.title,
+            scope: err.scope,
+            variantId: err.variantId,
+            variantSku: err.variantSku ?? undefined,
+            shopifyVariantId: err.shopifyVariantId,
+            message: err.message,
+          })
+          onProgress?.(progress, err.message)
+          if (logId) {
+            updateSyncLog(supabase, logId, 'partial', progress, err.message, true)
+          }
+        }
+
+        await importProduct(supabase, product, recordError)
         progress.imported++
         processedSinceLastReport++
         console.log(
@@ -220,7 +270,10 @@ export async function importAllProducts(
         const errorMessage = error instanceof Error ? error.message : String(error)
         progress.errors.push({
           productId: product.id,
-          error: errorMessage,
+          shopifyProductId,
+          title: product.title,
+          scope: 'product',
+          message: errorMessage,
         })
         console.error(
           `[Import] ${progress.imported}/${progress.total} ERROR ${product.title} (shopify_product_id=${shopifyProductId}):`,
@@ -282,7 +335,14 @@ async function upsertShopifyMedia(
   supabase: SupabaseClient,
   product: ShopifyProduct,
   productId: string,
-  shopifyProductId: number
+  shopifyProductId: number,
+  recordError?: (error: {
+    message: string
+    scope?: 'product' | 'variant' | 'media'
+    variantId?: string
+    variantSku?: string | null
+    shopifyVariantId?: number | null
+  }) => void
 ) {
   const mediaEdges = product.media?.edges || []
   const now = new Date().toISOString()
@@ -323,6 +383,10 @@ async function upsertShopifyMedia(
       )
 
     if (error) {
+      recordError?.({
+        message: error.message,
+        scope: 'media',
+      })
       console.error(`Failed to upsert Shopify media ${node.id}:`, error.message)
     }
   }
@@ -356,7 +420,14 @@ function guessMime(filename: string): string | null {
 async function upsertVariantHeroMedia(
   supabase: SupabaseClient,
   product: ShopifyProduct,
-  productId: string
+  productId: string,
+  recordError?: (error: {
+    message: string
+    scope?: 'product' | 'variant' | 'media'
+    variantId?: string
+    variantSku?: string | null
+    shopifyVariantId?: number | null
+  }) => void
 ) {
   const variants = product.variants?.edges || []
   const now = new Date().toISOString()
@@ -396,6 +467,12 @@ async function upsertVariantHeroMedia(
       )
 
     if (error) {
+      recordError?.({
+        message: error.message,
+        scope: 'media',
+        variantId: variant.id,
+        shopifyVariantId: extractShopifyId(variant.id),
+      })
       console.error(`Failed to upsert variant hero media ${image.id}:`, error.message)
     }
   }
@@ -419,6 +496,7 @@ async function updateSyncLog(
         skipped: progress.skipped,
         errors: progress.errors.length,
         lastError,
+        error_items: progress.errors.slice(-20),
         in_progress: inProgress ?? false,
       },
       updated_at: new Date().toISOString(),

@@ -8,4 +8,5 @@ Baseline and migration notes
 Typical bootstrap for a fresh environment:
 - Apply `00008_prod_schema.sql`.
 - Apply any newer incremental migrations that follow it.
+- Optionally, use `scripts/reset-db.sh` (non-prod) to drop/recreate the public schema and apply the baseline to a target database. Requires `CONFIRM_RESET=yes` and `DATABASE_URL` (non-prod only).
 
