@@ -111,6 +111,19 @@ export async function GET() {
       .limit(1)
       .maybeSingle()
 
+    // Recent errors (if any) for display
+    const { data: recentErrors } = await supabase
+      .from('sync_logs')
+      .select(`
+        id,
+        created_at,
+        status,
+        details
+      `)
+      .not('details->>lastError', 'is', null)
+      .order('created_at', { ascending: false })
+      .limit(10)
+
     return NextResponse.json({
       running: runningLog
         ? {
@@ -132,6 +145,12 @@ export async function GET() {
         count: mediaCount ?? 0,
         lastUpdated: mediaLast?.updated_at ?? null,
       },
+      recentErrors: recentErrors?.map((row) => ({
+        id: row.id,
+        createdAt: row.created_at,
+        status: row.status,
+        lastError: row.details?.lastError ?? null,
+      })) ?? [],
     })
   } catch (error) {
     console.error('Status error:', error)

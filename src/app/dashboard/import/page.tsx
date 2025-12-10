@@ -25,6 +25,12 @@ interface ImportStatus {
     count: number
     lastUpdated: string | null
   }
+  recentErrors?: Array<{
+    id: string
+    createdAt: string
+    status: string
+    lastError: string | null
+  }>
 }
 
 interface ImportResult {
@@ -46,6 +52,9 @@ export default function ImportPage() {
   const [logText, setLogText] = useState('')
   const [logError, setLogError] = useState<string | null>(null)
   const logRef = useRef<HTMLDivElement | null>(null)
+  const [recentErrors, setRecentErrors] = useState<
+    Array<{ id: string; createdAt: string; status: string; lastError: string | null }>
+  >([])
 
   useEffect(() => {
     fetchStatus()
@@ -74,6 +83,7 @@ export default function ImportPage() {
       if (res.ok) {
         const data = await res.json()
         setStatus(data)
+        setRecentErrors(data.recentErrors || [])
       }
     } catch (err) {
       console.error('Failed to fetch status:', err)
@@ -296,6 +306,31 @@ export default function ImportPage() {
                 : logText
                   ? logText
                   : 'No log output yet.'}
+            </div>
+          </div>
+
+          {/* Recent Errors */}
+          <div className="mt-4 space-y-2">
+            <div className="flex items-center justify-between">
+              <p className="text-sm text-slate-400">Recent import errors (last 10)</p>
+              <button
+                onClick={fetchStatus}
+                className="text-xs px-3 py-1 rounded-md bg-slate-700 text-slate-200 hover:bg-slate-600 transition"
+              >
+                Refresh
+              </button>
+            </div>
+            <div className="bg-slate-900/60 border border-slate-700/70 rounded-lg p-3 text-xs text-slate-200 space-y-2">
+              {recentErrors.length === 0 && <div className="text-slate-500">No recent errors.</div>}
+              {recentErrors.map((err) => (
+                <div key={err.id} className="border-b border-slate-800 pb-2 last:border-b-0 last:pb-0">
+                  <div className="flex items-center justify-between text-slate-400">
+                    <span>{new Date(err.createdAt).toLocaleString()}</span>
+                    <span className="uppercase text-[11px] text-amber-300">{err.status}</span>
+                  </div>
+                  {err.lastError && <div className="text-slate-200 mt-1">{err.lastError}</div>}
+                </div>
+              ))}
             </div>
           </div>
         </div>
